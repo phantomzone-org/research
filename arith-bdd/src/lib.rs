@@ -8,6 +8,31 @@ use petgraph::{
     visit::{EdgeRef, NodeRef},
 };
 
+fn unsigned_comparitor(bits: usize) -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::BddVariableSet) {
+    let vars_arr: Vec<String> = (0..bits)
+        .map(|i| format!("a{}", i))
+        .chain((0..bits).map(|i| format!("b{}", i)))
+        .collect();
+    let vars_arr_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
+    let vars = BddVariableSet::new(&vars_arr_ref);
+    let mut a = vec![];
+    let mut b = vec![];
+    (0..bits).for_each(|i| {
+        a.push(vars.mk_var_by_name(&format!("a{}", i)));
+        b.push(vars.mk_var_by_name(&format!("b{}", i)));
+    });
+
+    let mut comp = a[bits - 1].and(&b[bits - 1].not());
+    let mut not_casc = (a[bits - 1].xor(&b[bits - 1])).not();
+
+    for i in (0..bits - 1).rev() {
+        comp = comp.or(&(a[i].and(&b[i].not())).and(&not_casc));
+        not_casc = not_casc.and(&(a[i].xor(&b[i])).not());
+    }
+
+    (comp, vars)
+}
+
 fn add(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
     let vars_arr: Vec<String> = (0..bits)
         .map(|i| format!("a{}", i))
@@ -37,75 +62,6 @@ fn add(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
     }
 
     (out, vars)
-}
-
-fn add2() {
-    // Compute generator and propogator bits
-    {
-        let vars0 = BddVariableSet::new(&["a0", "b0", "c0"]);
-        let a0 = vars0.mk_not_var_by_name("a0");
-        let b0 = vars0.mk_not_var_by_name("b0");
-        let c0 = vars0.mk_not_var_by_name("c0");
-
-        let g0 = a0.and(&b0);
-        let p0 = a0.or(&b0);
-        let s0 = p0.or(&c0);
-
-        // s0.to_dot_string(variables, zero_pruned);
-        println!("{}", s0.to_dot_string(&vars0, false));
-    }
-
-    //
-    {
-        let vars1 = BddVariableSet::new(&["g0", "g1", "p0", "p1"]);
-        let g0 = vars1.mk_not_var_by_name("g0");
-        let p0 = vars1.mk_not_var_by_name("p0");
-        let g1 = vars1.mk_not_var_by_name("g1");
-        let p1 = vars1.mk_not_var_by_name("p1");
-
-        let g_out = g0.or(&p0.and(&g1));
-        let p_out = p0.and(&p1);
-
-        println!("{}", g_out.to_dot_string(&vars1, false));
-    }
-}
-
-fn add_gp_bits_special() -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::Bdd, Vec<String>) {
-    let vars1 = BddVariableSet::new(&["g0", "g1", "g2", "g3", "p0", "p1", "p2", "p3"]);
-    let g0 = vars1.mk_not_var_by_name("g0");
-    let p0 = vars1.mk_not_var_by_name("p0");
-    let g1 = vars1.mk_not_var_by_name("g1");
-    let p1 = vars1.mk_not_var_by_name("p1");
-    let g2 = vars1.mk_not_var_by_name("g2");
-    let p2 = vars1.mk_not_var_by_name("p2");
-    let g3 = vars1.mk_not_var_by_name("g3");
-    let p3 = vars1.mk_not_var_by_name("p3");
-
-    let c1g = g1.or(&p1.and(&g0));
-    let mut c3g = g3.or(&p3.and(&g2));
-    let mut c3p = p3.and(&p2);
-    let c2 = g2.or(&p2.and(&c1g));
-    c3g = c3g.or(&c3p.and(&c1g));
-
-    println!("{}", c3g.to_dot_string(&vars1, false));
-    println!("{}", c1g.to_dot_string(&vars1, false));
-
-    return (c3g, c2, vars1.variable_names());
-}
-
-fn add_gp_bits() -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::Bdd, Vec<String>) {
-    let vars1 = BddVariableSet::new(&["g0", "g1", "p0", "p1"]);
-    let g0 = vars1.mk_not_var_by_name("g0");
-    let p0 = vars1.mk_not_var_by_name("p0");
-    let g1 = vars1.mk_not_var_by_name("g1");
-    let p1 = vars1.mk_not_var_by_name("p1");
-
-    let g_out = g0.or(&p0.and(&g1));
-    let p_out = p0.and(&p1);
-
-    println!("{}", g_out.to_dot_string(&vars1, false));
-
-    return (g_out, p_out, vars1.variable_names());
 }
 
 fn updown_bdd_from_bdd(bdd: &Bdd, var_names: &[String]) -> UpDownBDD {
@@ -251,6 +207,9 @@ impl UpDownBDD {
             .collect()
     }
 
+    fn depth(&self) -> usize {
+        self.level_boundaries.len() - 1
+    }
     // TODO: fn for external product depth, etc.
 }
 
@@ -344,13 +303,13 @@ impl fmt::Display for Node {
         )
     }
 }
-
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_add() {
-        let bits = 10;
+        let bits = 3;
         let (summands, var_names) = add(bits);
 
         // println!("{}", actual_bdd.to_dot_string(&var_names, false));
@@ -405,6 +364,54 @@ mod tests {
                     );
                     assert_eq!(j_bdd_out as usize, j_out.value);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unsigned_comparitor() {
+        let bits = 5;
+        let (comp_bdd, var_names) = unsigned_comparitor(bits);
+
+        // println!("{}", actual_bdd.to_dot_string(&var_names, false));
+        let comp_udbdd = updown_bdd_from_bdd(&comp_bdd, &var_names.variable_names());
+
+        let input_variables: Vec<String> = (0..bits)
+            .map(|i| format!("a{}", i))
+            .chain((0..bits).map(|i| format!("b{}", i)))
+            .collect();
+        // Stores the index at which GGSW ciphertext of j^th node is stored.
+        // Note that j=0,1 are terminal nodes and are never accessed
+        let mut input_index_map = vec![0, 0];
+        comp_udbdd.node_tags().iter().skip(2).for_each(|tag| {
+            let index_in_input = input_variables.iter().position(|t| tag == t).unwrap();
+            input_index_map.push(index_in_input);
+        });
+
+        println!("UpDownBDD depth = {}", comp_udbdd.depth());
+
+        for a in 0..1usize << bits {
+            for b in 0..1usize << bits {
+                let inputs: Vec<GGSW> = [a, b]
+                    .iter()
+                    .flat_map::<Vec<GGSW>, _>(|v| {
+                        (0..bits).map(|e| GGSW::from((v >> e) & 1)).collect()
+                    })
+                    .collect();
+                let input_bools: Vec<bool> = inputs.iter().map(|c| c.bit).collect();
+
+                let c = a > b;
+
+                let bdd_out = comp_bdd.eval_in(&BddValuation::new(input_bools));
+                let out = execute(&comp_udbdd, &inputs, &input_index_map);
+
+                assert_eq!(out.value == 1, bdd_out);
+                assert_eq!(
+                    c,
+                    out.value == 1,
+                    "expected {c} but got {} for a={a} > b={b}",
+                    out.value == 1
+                );
             }
         }
     }
