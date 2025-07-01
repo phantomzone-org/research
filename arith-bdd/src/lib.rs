@@ -10,8 +10,7 @@ use petgraph::{
 
 fn unsigned_comparitor(bits: usize) -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::BddVariableSet) {
     let vars_arr: Vec<String> = (0..bits)
-        .map(|i| format!("a{}", i))
-        .chain((0..bits).map(|i| format!("b{}", i)))
+        .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
         .collect();
     let vars_arr_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
     let vars = BddVariableSet::new(&vars_arr_ref);
@@ -33,10 +32,14 @@ fn unsigned_comparitor(bits: usize) -> (biodivine_lib_bdd::Bdd, biodivine_lib_bd
     (comp, vars)
 }
 
+// Note: variables that are used together must be placed next to each other in variable array. This is because width of the resulting BDD depends on variable
+// ordering. If variables that are used together are placed far apart in the ordering, the resulting BDD is very wide. In fact the width at haldway through
+// the depth doubles with every bit.
+//
+// This is why we prefer criss cross input bit order: a0 b0 a1 b1... and not a0 a1 ... a{n-1} b0 b1 ....
 fn add(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
     let vars_arr: Vec<String> = (0..bits)
-        .map(|i| format!("a{}", i))
-        .chain((0..bits).map(|i| format!("b{}", i)))
+        .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
         .collect();
     let vars_arr_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
     let vars = BddVariableSet::new(&vars_arr_ref);
@@ -56,9 +59,8 @@ fn add(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
     for i in 1..bits {
         // full adder
         let s = (a[i].xor(&b[i])).xor(&c);
-        c = (a[i].and(&b[i])).or(&(a[i].xor(&b[i])).and(&c));
-
         out.push(s);
+        c = (a[i].and(&b[i])).or(&(a[i].xor(&b[i])).and(&c));
     }
 
     (out, vars)
@@ -211,6 +213,31 @@ impl UpDownBDD {
         self.level_boundaries.len() - 1
     }
     // TODO: fn for external product depth, etc.
+
+    fn stats(&self) -> String {
+        // depth
+        // nodes per depth
+        // node count
+
+        let mut buffer = String::new();
+        buffer.push_str("\n");
+        buffer.push_str(&format!("Depth                 = {}\n", self.depth()));
+        buffer.push_str(&format!(
+            "Total node count      = {}\n",
+            self.nodes_levelled.len() - 2
+        ));
+        buffer.push_str(&format!("Node count at depth   = \n"));
+        for i in 0..self.level_boundaries.len() - 1 {
+            buffer.push_str(&format!(
+                "      depth {} = {}\n",
+                i + 1,
+                self.level_boundaries[i + 1] - self.level_boundaries[i]
+            ));
+        }
+        buffer.push_str("\n");
+
+        return buffer;
+    }
 }
 
 struct GGSW {
@@ -309,20 +336,22 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let bits = 3;
+        let bits = 8;
         let (summands, var_names) = add(bits);
 
-        // println!("{}", actual_bdd.to_dot_string(&var_names, false));
+        // println!("{}", summands[2].to_dot_string(&var_names, false));
 
         let si_updown_bdd: Vec<UpDownBDD> = summands
             .iter()
             .map(|si_bdd| updown_bdd_from_bdd(si_bdd, &var_names.variable_names()))
             .collect();
+
+        println!("Si last stats: {}", si_updown_bdd[bits - 1].stats());
         // println!("{:?}", si_updown_bdd.node_tags());
 
+        // inputs are ordered as a0 b0 a1 b1...
         let input_variables: Vec<String> = (0..bits)
-            .map(|i| format!("a{}", i))
-            .chain((0..bits).map(|i| format!("b{}", i)))
+            .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
             .collect();
         let si_input_index_map: Vec<Vec<usize>> = si_updown_bdd
             .iter()
@@ -339,13 +368,10 @@ mod tests {
             })
             .collect();
 
-        for a in 0..1usize << bits {
-            for b in 0..1 << bits {
-                let inputs: Vec<GGSW> = [a, b]
-                    .iter()
-                    .flat_map::<Vec<GGSW>, _>(|v| {
-                        (0..bits).map(|e| GGSW::from((v >> e) & 1)).collect()
-                    })
+        for a in 0..1usize << std::cmp::min(10, bits) {
+            for b in 0..1 << std::cmp::min(10, bits) {
+                let inputs: Vec<GGSW> = (0..bits)
+                    .flat_map(|e| [GGSW::from((a >> e) & 1), GGSW::from((b >> e) & 1)])
                     .collect();
                 let input_bools: Vec<bool> = inputs.iter().map(|c| c.bit).collect();
 
@@ -377,8 +403,7 @@ mod tests {
         let comp_udbdd = updown_bdd_from_bdd(&comp_bdd, &var_names.variable_names());
 
         let input_variables: Vec<String> = (0..bits)
-            .map(|i| format!("a{}", i))
-            .chain((0..bits).map(|i| format!("b{}", i)))
+            .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
             .collect();
         // Stores the index at which GGSW ciphertext of j^th node is stored.
         // Note that j=0,1 are terminal nodes and are never accessed
@@ -388,15 +413,12 @@ mod tests {
             input_index_map.push(index_in_input);
         });
 
-        println!("UpDownBDD depth = {}", comp_udbdd.depth());
+        println!("Comp UpDownBDD stats: {}", comp_udbdd.stats());
 
-        for a in 0..1usize << bits {
-            for b in 0..1usize << bits {
-                let inputs: Vec<GGSW> = [a, b]
-                    .iter()
-                    .flat_map::<Vec<GGSW>, _>(|v| {
-                        (0..bits).map(|e| GGSW::from((v >> e) & 1)).collect()
-                    })
+        for a in 0..1usize << std::cmp::min(10, bits) {
+            for b in 0..1usize << std::cmp::min(10, bits) {
+                let inputs: Vec<GGSW> = (0..bits)
+                    .flat_map(|e| [GGSW::from((a >> e) & 1), GGSW::from((b >> e) & 1)])
                     .collect();
                 let input_bools: Vec<bool> = inputs.iter().map(|c| c.bit).collect();
 
@@ -414,5 +436,12 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dawda() {
+        let bits = 15;
+        let (summands, var_names) = unsigned_comparitor(bits);
+        println!("{}", summands.to_dot_string(&var_names, false));
     }
 }
