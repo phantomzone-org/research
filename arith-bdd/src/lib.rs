@@ -1,17 +1,16 @@
+use std::collections::HashMap;
 use std::fmt;
-use std::{collections::HashMap, ops::Not, str::FromStr};
 // use petgraph::dot::dot_parser::
 use biodivine_lib_bdd::*;
+use petgraph::Graph;
+use petgraph::algo::toposort;
 use petgraph::{
-    dot::{Config, Dot},
     graph::{DiGraph, NodeIndex},
-    visit::{EdgeRef, NodeRef},
+    visit::EdgeRef,
 };
 
 fn unsigned_comparitor(bits: usize) -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::BddVariableSet) {
-    let vars_arr: Vec<String> = (0..bits)
-        .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
-        .collect();
+    let vars_arr: Vec<String> = unsigned_comparitor_bdd_variable_order(bits);
     let vars_arr_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
     let vars = BddVariableSet::new(&vars_arr_ref);
     let mut a = vec![];
@@ -32,17 +31,30 @@ fn unsigned_comparitor(bits: usize) -> (biodivine_lib_bdd::Bdd, biodivine_lib_bd
     (comp, vars)
 }
 
+fn unsigned_comparitor_input_order(bits: usize) -> Vec<String> {
+    (0..bits)
+        .map(|i| format!("a{}", i))
+        .chain((0..bits).map(|i| format!("b{}", i)))
+        .collect()
+}
+
+fn unsigned_comparitor_bdd_variable_order(bits: usize) -> Vec<String> {
+    (0..bits)
+        .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
+        .collect()
+}
+
 // Note: variables that are used together must be placed next to each other in variable array. This is because width of the resulting BDD depends on variable
 // ordering. If variables that are used together are placed far apart in the ordering, the resulting BDD is very wide. In fact the width at haldway through
 // the depth doubles with every bit.
 //
 // This is why we prefer criss cross input bit order: a0 b0 a1 b1... and not a0 a1 ... a{n-1} b0 b1 ....
+//
+// TODO: Variable ordering determines BDD. What's the optimal variable ordering per circuit, heuristically?
 fn add(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
-    let vars_arr: Vec<String> = (0..bits)
-        .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
-        .collect();
-    let vars_arr_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
-    let vars = BddVariableSet::new(&vars_arr_ref);
+    let vars_arr: Vec<String> = unsigned_add_bdd_variable_order(bits);
+    let vars_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
+    let vars = BddVariableSet::new(&vars_ref);
     let mut a = vec![];
     let mut b = vec![];
     (0..bits).for_each(|i| {
@@ -66,7 +78,38 @@ fn add(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
     (out, vars)
 }
 
-fn updown_bdd_from_bdd(bdd: &Bdd, var_names: &[String]) -> UpDownBDD {
+fn unsigned_add_input_order(bits: usize) -> Vec<String> {
+    (0..bits)
+        .map(|i| format!("a{}", i))
+        .chain((0..bits).map(|i| format!("b{}", i)))
+        .collect()
+}
+
+fn unsigned_add_bdd_variable_order(bits: usize) -> Vec<String> {
+    (0..bits)
+        .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
+        .collect()
+}
+
+fn levels_for_graph(graph: &Graph<&str, i32>) -> HashMap<NodeIndex, usize> {
+    let top_sort = toposort(graph, Default::default()).unwrap();
+
+    let mut level_map = HashMap::new();
+
+    for i in 0..top_sort.len() {
+        let mut level = 0;
+        for incoming_edge in graph.edges_directed(top_sort[i], petgraph::Direction::Incoming) {
+            let pred = incoming_edge.source();
+            level = std::cmp::max(level, *level_map.get(&pred).unwrap() + 1);
+        }
+        assert!(level_map.insert(top_sort[i], level).is_none())
+    }
+
+    level_map
+}
+
+fn updown_bdd_from_bdd(bdd: &Bdd, vars: &BddVariableSet) -> UpDownBDD {
+    let var_names = vars.variable_names();
     if var_names.len() != (bdd.num_vars() as usize) {
         panic!(
             "Bdd is incompatible with the variable set ({} vs. {} variables)",
@@ -113,26 +156,7 @@ fn updown_bdd_from_bdd(bdd: &Bdd, var_names: &[String]) -> UpDownBDD {
     // println!("{}", dot);
 
     // create upside BDD repr. for our purposes
-    let mut node_index_to_lvl = HashMap::new();
-    fn dfs(
-        curr_node: NodeIndex,
-        curr_level: usize,
-        level_map: &mut HashMap<NodeIndex, usize>,
-        graph: &petgraph::Graph<&str, i32>,
-    ) {
-        if let Some(existing_lvl) = level_map.get(&curr_node) {
-            level_map.insert(curr_node, std::cmp::max(curr_level, *existing_lvl));
-        } else {
-            level_map.insert(curr_node, curr_level);
-        }
-        for node in graph.edges_directed(curr_node, petgraph::Direction::Outgoing) {
-            dfs(node.target(), curr_level + 1, level_map, graph);
-        }
-    }
-    for r_node in [terminal_node0, terminal_node1] {
-        dfs(r_node, 0, &mut node_index_to_lvl, &graph);
-    }
-
+    let node_index_to_lvl = levels_for_graph(&graph);
     // println!("Node levels = {:?}", node_index_to_lvl);
 
     // Level boundaries
@@ -158,20 +182,7 @@ fn updown_bdd_from_bdd(bdd: &Bdd, var_names: &[String]) -> UpDownBDD {
                 let low_index = graph
                     .edges_directed(*k, petgraph::Direction::Incoming)
                     .find(|e| *e.weight() == 0)
-                    .map(|e| {
-                        // if tmp_node_index_to_index.get(&e.source()).is_none() {
-                        //     println!("ASS: {:?}", tmp_node_index_to_index);
-                        //     println!(
-                        //         "Level = {}, Curr node tag = {:?}, Curr node index = {:?}, Missing node tag = {:?}, Missing node index = {:?}",
-                        //         level,
-                        //         graph.node_weight(*k),
-                        //         *k,
-                        //         graph.node_weight(e.source()),
-                        //         e.source()
-                        //     );
-                        // }
-                        *tmp_node_index_to_index.get(&e.source()).unwrap()
-                    });
+                    .map(|e| *tmp_node_index_to_index.get(&e.source()).unwrap());
                 let tag = *graph.node_weight(*k).unwrap();
                 assert!(high_index.is_some());
                 assert!(low_index.is_some());
@@ -201,24 +212,15 @@ impl UpDownBDD {
         }
     }
 
-    fn node_tags(&self) -> Vec<String> {
-        self.nodes_levelled
-            .iter()
-            .enumerate()
-            .map(|(index, n)| n.tag.clone())
-            .collect()
+    fn nodes_levelled(&self) -> &[Node] {
+        &self.nodes_levelled
     }
 
     fn depth(&self) -> usize {
         self.level_boundaries.len() - 1
     }
-    // TODO: fn for external product depth, etc.
 
     fn stats(&self) -> String {
-        // depth
-        // nodes per depth
-        // node count
-
         let mut buffer = String::new();
         buffer.push_str("\n");
         buffer.push_str(&format!("Depth                 = {}\n", self.depth()));
@@ -238,6 +240,40 @@ impl UpDownBDD {
 
         return buffer;
     }
+}
+
+fn input_to_udbdd_index_map(nodes_levelled: &[Node], vars_input_order: &[String]) -> Vec<usize> {
+    // Stores the index at which GGSW ciphertext of j^th node is stored.
+    // Note that j=0,1 are terminal nodes and are never accessed
+    let mut input_index_map = vec![0, 0];
+    nodes_levelled.iter().skip(2).for_each(|node| {
+        let index_in_input = vars_input_order
+            .iter()
+            .position(|t| &node.tag == t)
+            .unwrap();
+        input_index_map.push(index_in_input);
+    });
+    input_index_map
+}
+
+fn input_to_bdd_var_input(
+    input_order: &[String],
+    bdd_input_order: &[String],
+    input_bits: &[u8],
+) -> Vec<bool> {
+    assert!(input_order.len() == bdd_input_order.len());
+    assert!(input_order.len() == input_bits.len());
+
+    let mut bdd_input = vec![false; input_order.len()];
+    bdd_input_order
+        .iter()
+        .enumerate()
+        .for_each(|(bdd_idx, bdd_var)| {
+            let pos = input_order.iter().position(|var| var == bdd_var).unwrap();
+            assert!(input_bits[pos] <= 1);
+            bdd_input[bdd_idx] = input_bits[pos] == 1;
+        });
+    return bdd_input;
 }
 
 struct GGSW {
@@ -332,48 +368,38 @@ impl fmt::Display for Node {
 }
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
     fn test_add() {
-        let bits = 8;
-        let (summands, var_names) = add(bits);
-
-        // println!("{}", summands[2].to_dot_string(&var_names, false));
+        let bits = 10;
+        let (summands, vars) = add(bits);
 
         let si_updown_bdd: Vec<UpDownBDD> = summands
             .iter()
-            .map(|si_bdd| updown_bdd_from_bdd(si_bdd, &var_names.variable_names()))
+            .map(|si_bdd| updown_bdd_from_bdd(si_bdd, &vars))
             .collect();
 
-        println!("Si last stats: {}", si_updown_bdd[bits - 1].stats());
+        // println!("Si last stats: {}", si_updown_bdd[bits - 1].stats());
         // println!("{:?}", si_updown_bdd.node_tags());
 
-        // inputs are ordered as a0 b0 a1 b1...
-        let input_variables: Vec<String> = (0..bits)
-            .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
-            .collect();
-        let si_input_index_map: Vec<Vec<usize>> = si_updown_bdd
+        let input_order = unsigned_add_input_order(bits);
+        let bdd_var_order = unsigned_add_bdd_variable_order(bits);
+        let input_to_udbdd_idx_map: Vec<Vec<usize>> = si_updown_bdd
             .iter()
-            .map(|si_udbdd| {
-                let node_order = si_udbdd.node_tags();
-                // Stores the index at which GGSW ciphertext of j^th node is stored.
-                // Note that j=0,1 are terminal nodes and are never accessed
-                let mut input_index_map = vec![0, 0];
-                node_order.iter().skip(2).for_each(|tag| {
-                    let index_in_input = input_variables.iter().position(|t| tag == t).unwrap();
-                    input_index_map.push(index_in_input);
-                });
-                input_index_map
-            })
+            .map(|udbdd| input_to_udbdd_index_map(udbdd.nodes_levelled(), &input_order))
             .collect();
 
         for a in 0..1usize << std::cmp::min(10, bits) {
             for b in 0..1 << std::cmp::min(10, bits) {
-                let inputs: Vec<GGSW> = (0..bits)
-                    .flat_map(|e| [GGSW::from((a >> e) & 1), GGSW::from((b >> e) & 1)])
+                let input_bits: Vec<u8> = [a, b]
+                    .iter()
+                    .flat_map(|v| (0..bits).map(|e| ((*v >> e) & 1) as u8))
                     .collect();
-                let input_bools: Vec<bool> = inputs.iter().map(|c| c.bit).collect();
+                let input_bools = input_to_bdd_var_input(&input_order, &bdd_var_order, &input_bits);
+                let inputs: Vec<GGSW> =
+                    input_bits.iter().map(|b| GGSW::from(*b as usize)).collect();
 
                 let c = (a + b) % (1 << bits);
 
@@ -381,7 +407,7 @@ mod tests {
                     let cj_bit = (c >> j) & 1;
 
                     let j_bdd_out = summands[j].eval_in(&BddValuation::new(input_bools.clone()));
-                    let j_out = execute(&si_updown_bdd[j], &inputs, &si_input_index_map[j]);
+                    let j_out = execute(&si_updown_bdd[j], &inputs, &input_to_udbdd_idx_map[j]);
 
                     assert_eq!(
                         cj_bit, j_out.value,
@@ -396,31 +422,33 @@ mod tests {
 
     #[test]
     fn test_unsigned_comparitor() {
-        let bits = 5;
-        let (comp_bdd, var_names) = unsigned_comparitor(bits);
+        let bits = 10;
+        let (comp_bdd, vars) = unsigned_comparitor(bits);
 
         // println!("{}", actual_bdd.to_dot_string(&var_names, false));
-        let comp_udbdd = updown_bdd_from_bdd(&comp_bdd, &var_names.variable_names());
-
-        let input_variables: Vec<String> = (0..bits)
-            .flat_map(|i| [format!("a{}", i), format!("b{}", i)])
-            .collect();
-        // Stores the index at which GGSW ciphertext of j^th node is stored.
-        // Note that j=0,1 are terminal nodes and are never accessed
-        let mut input_index_map = vec![0, 0];
-        comp_udbdd.node_tags().iter().skip(2).for_each(|tag| {
-            let index_in_input = input_variables.iter().position(|t| tag == t).unwrap();
-            input_index_map.push(index_in_input);
-        });
+        let comp_udbdd = updown_bdd_from_bdd(&comp_bdd, &vars);
+        let unsigned_comparator_input_order = unsigned_comparitor_input_order(bits);
+        let unsigned_comparator_bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
+        let input_index_map = input_to_udbdd_index_map(
+            comp_udbdd.nodes_levelled(),
+            &unsigned_comparator_input_order,
+        );
 
         println!("Comp UpDownBDD stats: {}", comp_udbdd.stats());
 
         for a in 0..1usize << std::cmp::min(10, bits) {
             for b in 0..1usize << std::cmp::min(10, bits) {
-                let inputs: Vec<GGSW> = (0..bits)
-                    .flat_map(|e| [GGSW::from((a >> e) & 1), GGSW::from((b >> e) & 1)])
+                let input_bits: Vec<u8> = [a, b]
+                    .iter()
+                    .flat_map(|v| (0..bits).map(|e| ((*v >> e) & 1) as u8))
                     .collect();
-                let input_bools: Vec<bool> = inputs.iter().map(|c| c.bit).collect();
+                let input_bools: Vec<bool> = input_to_bdd_var_input(
+                    &unsigned_comparator_input_order,
+                    &unsigned_comparator_bdd_var_order,
+                    &input_bits,
+                );
+                let inputs: Vec<GGSW> =
+                    input_bits.iter().map(|b| GGSW::from(*b as usize)).collect();
 
                 let c = a > b;
 
@@ -436,12 +464,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn dawda() {
-        let bits = 15;
-        let (summands, var_names) = unsigned_comparitor(bits);
-        println!("{}", summands.to_dot_string(&var_names, false));
     }
 }
