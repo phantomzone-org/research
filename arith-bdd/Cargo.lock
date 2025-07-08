@@ -14,6 +14,9 @@ version = "0.1.0"
 dependencies = [
  "biodivine-lib-bdd",
  "petgraph",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
