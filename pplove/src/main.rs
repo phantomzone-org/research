@@ -55,7 +55,7 @@ fn case1() {
     let data1 = random_data_in_mod(logn, k_pt, &mut source);
     let mut pt1 = GLWEPlaintext::alloc(&module, basek, k_pt);
     pt1.data.encode_vec_i64(0, basek, k_pt, &data1, k_pt);
-    let mut glwe1 = GLWECiphertext::alloc(&module, basek, basek * 2, rank);
+    let mut glwe1 = GLWECiphertext::alloc(&module, basek, basek * 3, rank);
     glwe1.encrypt_sk(
         &module,
         &pt1,
@@ -76,7 +76,7 @@ fn case1() {
     let data2 = random_data_in_mod(logn, k_pt, &mut source);
     let mut pt2 = GLWEPlaintext::alloc(&module, basek, k_pt);
     pt2.data.encode_vec_i64(0, basek, k_pt, &data2, k_pt);
-    let mut glwe2 = GLWECiphertext::alloc(&module, basek, basek * 3, rank);
+    let mut glwe2 = GLWECiphertext::alloc(&module, basek, basek * 2, rank);
     glwe2.encrypt_sk(
         &module,
         &pt2,
@@ -209,7 +209,7 @@ fn case2() {
 
 fn packing() {
     let basek = 20;
-    let logn = 4;
+    let logn = 5;
     let rank = 1;
     let module = Module::<FFT64>::new(1 << logn);
     let k_glwe = basek * 3;
@@ -232,13 +232,23 @@ fn packing() {
     sk.fill_binary_prob(0.5, &mut source);
     let sk_fourier = FourierGLWESecret::from(&module, &sk);
 
+    let log_batch = 4;
+
     let k_pt = logn;
-    let glwes = (0..module.n())
+    let multiples = (0..1 << log_batch)
+        .map(|i| i * (module.n() >> log_batch))
+        .collect_vec();
+    let glwes = (0..module.n() >> log_batch)
         .map(|i| {
             let mut data = vec![0; module.n()];
-            data[0] = uint_to_i64(i as u64, 1 << k_pt);
+            multiples.iter().for_each(|index| {
+                data[*index] = uint_to_i64(i as u64, 1 << k_pt);
+            });
+            // data[1 * (module.n() >> log_batch)] = uint_to_i64(i as u64, 1 << k_pt);
             let mut pt = GLWEPlaintext::alloc(&module, basek, k_pt);
             pt.data.encode_vec_i64(0, basek, k_pt, &data, k_pt);
+            // println!("data {i}: {:?}", &data);
+            // println!("pt   {i}: {:?}", &pt.data);
 
             let mut glwe1 = GLWECiphertext::alloc(&module, basek, k_glwe, rank);
             glwe1.encrypt_sk(
@@ -254,7 +264,7 @@ fn packing() {
         })
         .collect_vec();
 
-    let mut packer = GLWEPacker::new(&module, 0, basek, k_glwe, rank);
+    let mut packer = GLWEPacker::new(&module, log_batch, basek, k_glwe, rank);
 
     // Generate Auto keys
     let mut auto_keys: HashMap<i64, GLWEAutomorphismKey<Vec<u8>, FFT64>> = HashMap::new();
@@ -282,30 +292,28 @@ fn packing() {
     });
 
     // Pack GLWEs
-    let mut res = vec![];
     glwes.iter().for_each(|ct| {
-        packer.add(
-            &module,
-            &mut res,
-            Some(ct),
-            &auto_keys,
-            scratch_owned.borrow(),
-        );
+        packer.add(&module, Some(ct), &auto_keys, scratch_owned.borrow());
     });
+    let mut res = GLWECiphertext::alloc(&module, basek, k_glwe, rank);
+    packer.flush(&module, &mut res);
 
     let mut want_data = vec![0; module.n()];
-    (0..module.n()).for_each(|i| {
-        want_data[reverse_bits(i, logn as u32)] = uint_to_i64(i as u64, 1 << k_pt);
+    (0..module.n() >> log_batch).for_each(|i| {
+        for k in multiples.iter() {
+            want_data[k + reverse_bits(i, (logn - log_batch) as u32)] =
+                uint_to_i64(i as u64, 1 << k_pt);
+        }
     });
     let mut want_pt = GLWEPlaintext::alloc(&module, basek, k_pt);
     want_pt
         .data
         .encode_vec_i64(0, want_pt.basek(), want_pt.k(), &want_data, want_pt.k());
-    // println!("PT want = {}", want_pt.data);
+    println!("PT want = {}", want_pt.data);
 
-    let mut have_pt = GLWEPlaintext::alloc(&module, basek, res[0].k());
-    res[0].decrypt(&module, &mut have_pt, &sk_fourier, scratch_owned.borrow());
-    // println!("PT1 = {}", have_pt.data);
+    let mut have_pt = GLWEPlaintext::alloc(&module, basek, res.k());
+    res.decrypt(&module, &mut have_pt, &sk_fourier, scratch_owned.borrow());
+    println!("PT1 = {}", have_pt.data);
 
     have_pt.sub_inplace_ab(&module, &want_pt);
     println!("Noise = {}", have_pt.data.std(0, basek).log2());
@@ -316,8 +324,8 @@ fn reverse_bits(v: usize, bits: u32) -> usize {
 }
 
 fn main() {
-    // case1();
-    case2();
+    case1();
+    // case2();
     // packing();
     // println!("Hello, world!");
 }
