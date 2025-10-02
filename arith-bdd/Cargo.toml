@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-biodivine-lib-bdd = {path = "./../../biodivine-lib-bdd"}
+biodivine-lib-bdd = "0.6.2"
 petgraph = { version = "0.8.2" }
 quote = "1.0.40"
 proc-macro2 = "1.0.95"

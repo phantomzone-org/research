@@ -677,24 +677,24 @@ fn updown_bdd_from_bdd(
         assert!(
             bdd_index_to_node_index
                 .insert(
-                    node_pointer.0,
+                    node_pointer.to_index(),
                     graph.add_node(
-                        &var_names[bdd.var_of(node_pointer).0 as usize]
+                        &var_names[bdd.var_of(node_pointer).to_index()]
                     ),
                 )
                 .is_none()
         );
     }
     for node_pointer in bdd.pointers().skip(2) {
-        let curr_node = bdd_index_to_node_index.get(&node_pointer.0).unwrap();
+        let curr_node = bdd_index_to_node_index.get(&node_pointer.to_index()).unwrap();
 
         let high_link = bdd.high_link_of(node_pointer);
-        let high_node = bdd_index_to_node_index.get(&high_link.0).unwrap();
+        let high_node = bdd_index_to_node_index.get(&high_link.to_index()).unwrap();
         // directed edge from high link node to curr node
         graph.add_edge(*high_node, *curr_node, 1);
 
         let low_link = bdd.low_link_of(node_pointer);
-        let low_node = bdd_index_to_node_index.get(&low_link.0).unwrap();
+        let low_node = bdd_index_to_node_index.get(&low_link.to_index()).unwrap();
         // directed edge from low link node to curr node
         graph.add_edge(*low_node, *curr_node, 0);
     }
@@ -1522,8 +1522,8 @@ mod tests {
         println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
         println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
 
-        // codegen_singlebit_out(&unsigned_udbdd, "target/sltu_codegen.rs");
-        // codegen_singlebit_out(&signed_udbdd, "target/slt_codegen.rs");
+         codegen_singlebit_out(&unsigned_udbdd, "target/sltu_codegen.rs");
+         codegen_singlebit_out(&signed_udbdd, "target/slt_codegen.rs");
 
         let input_order = unsigned_comparitor_input_order(bits);
         let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
