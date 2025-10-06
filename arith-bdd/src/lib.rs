@@ -1,18 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::write;
 use std::{fmt::Display, iter};
 // use petgraph::dot::dot_parser::
 use biodivine_lib_bdd::*;
+use itertools::Itertools;
 use petgraph::Direction::Outgoing;
 use petgraph::Graph;
 use petgraph::algo::toposort;
 use petgraph::dot::Dot;
+use petgraph::visit::NodeRef;
 use petgraph::{
     graph::{DiGraph, NodeIndex},
     visit::EdgeRef,
 };
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::fs::write;
 use syn::parse_str;
 
 // Note on variable ordering:
@@ -702,85 +704,151 @@ fn updown_bdd_from_bdd(
     // let dot = Dot::with_config(&graph, &[]).to_string();
     // println!("{}", dot);
 
-    // create upside BDD repr. for our purposes
+    // create upside BDD repr. for our purpose
     let node_index_to_lvl = levels_for_graph(&graph);
     // println!("Node levels = {:?}", node_index_to_lvl);
 
-    // Level boundaries
-    let mut level_bounds = vec![2];
-    // Nodes stored sorted by level in a contiguous array.
-    // Boundary between levels are defined in level_bounds. For ex, level_bounds[0] is index before which nodes of level 0 end and first node of level 1 exists.
-    let mut nodes_lvld = vec![
-        Node::new("0".to_string(), None, None),
-        Node::new("1".to_string(), None, None),
-    ];
-    let mut tmp_node_index_to_index = HashMap::new();
-    tmp_node_index_to_index.insert(terminal_node0, 0);
-    tmp_node_index_to_index.insert(terminal_node1, 1);
-    let mut curr_index = 2;
-    for level in 1..node_index_to_lvl.values().max().unwrap() + 1 {
-        for (k, v) in node_index_to_lvl.iter() {
-            // filter out nodes at level
-            if level == *v {
-                let high_index = graph
-                    .edges_directed(*k, petgraph::Direction::Incoming)
-                    .find(|e| *e.weight() == 1)
-                    .map(|e| {
-                        *tmp_node_index_to_index.get(&e.source()).unwrap()
-                    });
-                let low_index = graph
-                    .edges_directed(*k, petgraph::Direction::Incoming)
-                    .find(|e| *e.weight() == 0)
-                    .map(|e| {
-                        *tmp_node_index_to_index.get(&e.source()).unwrap()
-                    });
-                let tag = *graph.node_weight(*k).unwrap();
-                assert!(high_index.is_some());
-                assert!(low_index.is_some());
+    let max_level = node_index_to_lvl.values().max().unwrap();
+    let mut node_pos_all_lvls = HashMap::new();
+    let mut outputs_set = HashMap::new();
+    node_pos_all_lvls.insert(terminal_node0, 0);
+    node_pos_all_lvls.insert(terminal_node1, 1);
+    assert!(
+        node_index_to_lvl
+            .iter()
+            .filter(|(_, lvl)| *lvl == max_level)
+            .count()
+            == 1
+    );
+    let out_node = node_index_to_lvl
+        .iter()
+        .find(|(_, lvl)| *lvl == max_level)
+        .unwrap();
+    outputs_set.insert(*out_node.0, 0);
+    for lvl in (1..max_level + 1).rev() {
+        let mut nodes_at_lvl = node_index_to_lvl
+            .iter()
+            .filter(|(n, v)| **v == lvl)
+            .map(|(node, _)| outputs_set.remove_entry(node).unwrap())
+            .collect_vec();
+        // Sort to assign lower index output position to nodes with greater access depth
+        nodes_at_lvl.sort_by(|a, b| Ord::cmp(&b.1, &a.1));
+        // println!("nodes: {:?}", nodes_at_lvl);
 
-                nodes_lvld.push(Node::new(
-                    tag.to_string(),
-                    high_index,
-                    low_index,
-                ));
-                tmp_node_index_to_index.insert(*k, curr_index);
-
-                curr_index += 1;
-            }
+        // offset makes room in the output position for nodes that remain unremoved at this level
+        let offset = outputs_set.len();
+        for (index, (node_i, _)) in nodes_at_lvl.iter().enumerate() {
+            node_pos_all_lvls.insert(*node_i, index + offset);
         }
-        level_bounds.push(curr_index);
+
+        // Increment depth of unremoved output nodes by 1
+        outputs_set.iter_mut().for_each(|(_, depth)| *depth += 1);
+
+        // refill the output set for lvl - 1
+        for (node_i, _) in node_index_to_lvl.iter().filter(|(n, v)| **v == lvl)
+        {
+            graph
+                .edges_directed(*node_i, petgraph::Direction::Incoming)
+                .filter(|e| *e.weight() == 1 || *e.weight() == 0)
+                .for_each(|er| {
+                    let source_node = er.source();
+                    if !outputs_set.contains_key(&source_node) {
+                        outputs_set.insert(source_node, 0);
+                    }
+                });
+        }
+    }
+    assert!(outputs_set.remove(&terminal_node0).is_some());
+    assert!(outputs_set.remove(&terminal_node1).is_some());
+    assert!(outputs_set.is_empty());
+
+    let mut nodes_lvld = vec![];
+    for lvl in 1..max_level + 1 {
+        let mut curr_lvl = vec![];
+
+        let sorted_nodes = node_index_to_lvl
+            .iter()
+            .filter(|(n, v)| **v == lvl)
+            .sorted_by(|(a, _), (b, _)| {
+                Ord::cmp(
+                    node_pos_all_lvls.get(*a).unwrap(),
+                    node_pos_all_lvls.get(*b).unwrap(),
+                )
+            })
+            .collect_vec();
+
+        sorted_nodes.into_iter().for_each(|(node_i, output_index)| {
+            let node_weight = graph.node_weight(*node_i).unwrap().to_string();
+            let high_index = node_pos_all_lvls
+                .get(
+                    &graph
+                        .edges_directed(*node_i, petgraph::Direction::Incoming)
+                        .find(|e| *e.weight() == 1)
+                        .expect("High index should exist")
+                        .source(),
+                )
+                .unwrap();
+            let low_index = node_pos_all_lvls
+                .get(
+                    &graph
+                        .edges_directed(*node_i, petgraph::Direction::Incoming)
+                        .find(|e| *e.weight() == 0)
+                        .expect("Low index should exist")
+                        .source(),
+                )
+                .unwrap();
+            let input_index =
+                input_order.iter().position(|t| &node_weight == t).unwrap();
+
+            curr_lvl.push(Node::new(
+                node_weight,
+                *node_i,
+                *node_pos_all_lvls.get(node_i).unwrap(),
+                *high_index,
+                *low_index,
+                input_index,
+            ));
+        });
+
+        nodes_lvld.push(curr_lvl);
     }
 
-    // Set node's input index as per input order
-    //
-    // GGSW selector ciphertext for node[j] is stored at input[node[j].input_index]
-    nodes_lvld.iter_mut().skip(2).for_each(|node| {
-        node.input_index =
-            input_order.iter().position(|t| &node.tag == t).unwrap();
-    });
-
-    return UpDownBDD::new(nodes_lvld, level_bounds);
+    return UpDownBDD::new(nodes_lvld);
 }
 
 struct UpDownBDD {
-    nodes_levelled: Vec<Node>,
-    level_boundaries: Vec<usize>,
+    nodes_levelled: Vec<Vec<Node>>,
 }
 
 impl UpDownBDD {
-    fn new(nodes_levelled: Vec<Node>, level_boundaries: Vec<usize>) -> Self {
-        Self {
-            nodes_levelled,
-            level_boundaries,
-        }
+    fn new(nodes_levelled: Vec<Vec<Node>>) -> Self {
+        Self { nodes_levelled }
     }
 
-    fn nodes_levelled(&self) -> &[Node] {
+    fn nodes_levelled(&self) -> &[Vec<Node>] {
         &self.nodes_levelled
     }
 
     fn depth(&self) -> usize {
-        self.level_boundaries.len() - 1
+        self.nodes_levelled.len()
+    }
+
+    fn total_nodes(&self) -> usize {
+        let mut counter = 0;
+        for lvl in self.nodes_levelled().iter() {
+            counter += lvl.len();
+        }
+        counter
+    }
+
+    fn max_intermediate_storage(&self) -> usize {
+        let mut counter = 0;
+        for lvl in self.nodes_levelled().iter() {
+            for n in lvl {
+                counter = std::cmp::max(counter, n.output_pos);
+            }
+        }
+        counter + 1
     }
 
     fn stats(&self) -> String {
@@ -789,35 +857,34 @@ impl UpDownBDD {
         buffer.push_str(&format!("Depth                 = {}\n", self.depth()));
         buffer.push_str(&format!(
             "Total node count      = {}\n",
-            self.nodes_levelled.len() - 2
+            self.total_nodes()
         ));
         buffer.push_str(&format!("Node count at depth   = \n"));
-        for i in 0..self.level_boundaries.len() - 1 {
+        for (index, nodes_lvli) in self.nodes_levelled().iter().enumerate() {
             buffer.push_str(&format!(
                 "      depth {} = {}\n",
-                i + 1,
-                self.level_boundaries[i + 1] - self.level_boundaries[i]
+                index,
+                nodes_lvli.len()
             ));
         }
         buffer.push_str("\n");
 
         return buffer;
     }
+}
 
-    fn print(&self) -> String {
-        let mut buffer = String::new();
-        buffer.push_str("[");
-        self.nodes_levelled().iter().for_each(|node| {
-            buffer.push_str(&format!(
-                "Node::new({},{},{}),",
-                node.input_index,
-                node.high_index.unwrap_or_default(),
-                node.high_index.unwrap_or_default()
-            ));
-        });
-        buffer.push_str("]");
+impl Display for UpDownBDD {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "### UpDownBDD ###");
+        for (index, nodes) in self.nodes_levelled().iter().enumerate() {
+            write!(f, "Level {}: ", index)?;
+            for n in nodes {
+                write!(f, " {} ", n)?;
+            }
+            writeln!(f, "");
+        }
 
-        buffer
+        Ok(())
     }
 }
 
@@ -843,7 +910,7 @@ impl From<u8> for GGSW {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct GLWECt {
     value: usize,
 }
@@ -863,55 +930,53 @@ fn cmux(selector: &GGSW, if_true: &GLWECt, if_false: &GLWECt) -> GLWECt {
 }
 
 fn execute(bdd: &UpDownBDD, inputs: &[GGSW]) -> GLWECt {
-    let mut out = vec![GLWECt::new(0), GLWECt::new(1)];
+    let mut out = vec![GLWECt::default(); bdd.max_intermediate_storage()];
+    out[0] = GLWECt::new(0);
+    out[1] = GLWECt::new(1);
 
-    let lvl_bounds = &bdd.level_boundaries;
-    // starts at level 1
-    for i in 0..lvl_bounds.len() - 1 {
-        let start = lvl_bounds[i];
-        let end = lvl_bounds[i + 1];
-        for j in start..end {
-            let node = &bdd.nodes_levelled[j];
-            out.push(cmux(
+    for (lvl_i, lvl_nodes) in bdd.nodes_levelled().iter().enumerate() {
+        let out_old = out.clone();
+        for node in lvl_nodes {
+            // println!("Node={:?} level={}", node, lvl_i);
+            let o = cmux(
                 &inputs[node.input_index],
-                &out[node.high_index.unwrap()],
-                &out[node.low_index.unwrap()],
-            ));
+                &out_old[node.high_index],
+                &out_old[node.low_index],
+            );
+            out[node.output_pos] = o;
         }
     }
-
-    out[out.len() - 1].clone()
+    out[0].clone()
 }
 
 #[derive(Debug)]
 struct Node {
     tag: String,
-    high_index: Option<usize>,
-    low_index: Option<usize>,
+    // Store NodeIndex for debugging purposes
+    node_index: NodeIndex<u32>,
+    output_pos: usize,
+    high_index: usize,
+    low_index: usize,
     input_index: usize,
 }
 
 impl Node {
     fn new(
         tag: String,
-        high_index: Option<usize>,
-        low_index: Option<usize>,
+        node_index: NodeIndex<u32>,
+        output_pos: usize,
+        high_index: usize,
+        low_index: usize,
+        input_index: usize,
     ) -> Self {
-        // Node is either root or not
-        assert!(
-            (high_index.is_none() && low_index.is_none())
-                || (high_index.is_some() && low_index.is_some())
-        );
         Self {
             tag,
+            node_index,
             high_index,
+            output_pos,
             low_index,
-            input_index: 0,
+            input_index: input_index,
         }
-    }
-
-    fn is_root(&self) -> bool {
-        self.high_index.is_none() && self.low_index.is_none()
     }
 }
 
@@ -919,164 +984,169 @@ impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Node {{ tag: {}, high_index: {:?}, low_index: {:?} }}",
-            self.tag, self.high_index, self.low_index
+            "Node {{ tag: {}, node_index: {:?}, output_pos: {}, high_index: {}, low_index: {} }}",
+            self.tag,
+            self.node_index,
+            self.output_pos,
+            self.high_index,
+            self.low_index
         )
     }
 }
 
 fn codegen_singlebit_out(ubdd: &UpDownBDD, out_file: &str) {
-    let p1 = quote! {
-        use super::super::{BitCircuitInfo, Node};
-
-        pub(crate) struct BitCircuit<const N: usize, const K: usize> {
-           pub(crate) lvld_nodes: [Node; N],
-           pub(crate) lvl_bounds: [usize; K],
-        }
-
-        impl<const N: usize, const K: usize> BitCircuit<N, K> {
-            const fn new(lvld_nodes: [Node; N], lvl_bounds: [usize; K]) -> Self {
-                Self {
-                    lvld_nodes,
-                    lvl_bounds,
-                }
-            }
-        }
-        impl<const N: usize, const K: usize> BitCircuitInfo for BitCircuit<N, K> {
-            fn info(&self) -> (&[Node], &[usize]) {
-                (self.lvld_nodes.as_ref(), self.lvl_bounds.as_ref())
-            }
-        }
-    };
-
-    let node_count = ubdd.nodes_levelled().len();
-    let lvl_b_count = ubdd.level_boundaries.len();
-    let bit_circuit: TokenStream = {
-        let mut nodes_buffer = String::new();
-        let mut lvl_bounds_buffer = String::new();
-        ubdd.nodes_levelled().iter().for_each(|node| {
-            nodes_buffer.push_str(&format!(
-                "Node::new({},{},{}),",
-                node.input_index,
-                node.high_index.unwrap_or_default(),
-                node.low_index.unwrap_or_default()
-            ));
-        });
-        ubdd.level_boundaries.iter().for_each(|lb| {
-            lvl_bounds_buffer.push_str(&format!("{lb},"));
-        });
-
-        parse_str(&format!(
-            "BitCircuit::new([{}], [{}])",
-            nodes_buffer, lvl_bounds_buffer
-        ))
-        .unwrap()
-    };
-
-    let output = quote! {
-        #p1
-
-        pub(crate) static OUTPUT_CIRCUIT: BitCircuit<#node_count, #lvl_b_count> = #bit_circuit;
-    };
-
-    write(out_file, output.to_string()).expect("Unable to write to file");
+    // let p1 = quote! {
+    //     use super::super::{BitCircuitInfo, Node};
+    //
+    //     pub(crate) struct BitCircuit<const N: usize, const K: usize> {
+    //        pub(crate) lvld_nodes: [Node; N],
+    //        pub(crate) lvl_bounds: [usize; K],
+    //     }
+    //
+    //     impl<const N: usize, const K: usize> BitCircuit<N, K> {
+    //         const fn new(lvld_nodes: [Node; N], lvl_bounds: [usize; K]) -> Self {
+    //             Self {
+    //                 lvld_nodes,
+    //                 lvl_bounds,
+    //             }
+    //         }
+    //     }
+    //     impl<const N: usize, const K: usize> BitCircuitInfo for BitCircuit<N, K> {
+    //         fn info(&self) -> (&[Node], &[usize]) {
+    //             (self.lvld_nodes.as_ref(), self.lvl_bounds.as_ref())
+    //         }
+    //     }
+    // };
+    //
+    // let node_count = ubdd.nodes_levelled().len();
+    // let lvl_b_count = ubdd.level_boundaries.len();
+    // let bit_circuit: TokenStream = {
+    //     let mut nodes_buffer = String::new();
+    //     let mut lvl_bounds_buffer = String::new();
+    //     ubdd.nodes_levelled().iter().for_each(|node| {
+    //         nodes_buffer.push_str(&format!(
+    //             "Node::new({},{},{}),",
+    //             node.input_index,
+    //             node.high_index.unwrap_or_default(),
+    //             node.low_index.unwrap_or_default()
+    //         ));
+    //     });
+    //     ubdd.level_boundaries.iter().for_each(|lb| {
+    //         lvl_bounds_buffer.push_str(&format!("{lb},"));
+    //     });
+    //
+    //     parse_str(&format!(
+    //         "BitCircuit::new([{}], [{}])",
+    //         nodes_buffer, lvl_bounds_buffer
+    //     ))
+    //     .unwrap()
+    // };
+    //
+    // let output = quote! {
+    //     #p1
+    //
+    //     pub(crate) static OUTPUT_CIRCUIT: BitCircuit<#node_count, #lvl_b_count> = #bit_circuit;
+    // };
+    //
+    // write(out_file, output.to_string()).expect("Unable to write to file");
 }
 
 fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
-    let p1 = quote! {
-        use super::super::{BitCircuitInfo, Node};
-
-        pub(super) struct BitCircuit<const N: usize, const K: usize> {
-            lvld_nodes: [Node; N],
-            lvl_bounds: [usize; K],
-        }
-
-        impl<const N: usize, const K: usize> BitCircuit<N, K> {
-            const fn new(lvld_nodes: [Node; N], lvl_bounds: [usize; K]) -> Self {
-                Self {
-                    lvld_nodes,
-                    lvl_bounds,
-                }
-            }
-        }
-    };
-
-    let (v0, v1): (Vec<TokenStream>, Vec<TokenStream>) = udbdds
-        .iter()
-        .map(|bdd| {
-            let n = bdd.nodes_levelled().len();
-            let k = bdd.level_boundaries.len();
-
-            (
-                parse_str(&format!("C{n}x{k}(BitCircuit<{n}, {k}>)")).unwrap(),
-                parse_str(&format!("C{n}x{k}")).unwrap(),
-            )
-        })
-        .collect::<Vec<(TokenStream, TokenStream)>>()
-        .into_iter()
-        .unzip();
-
-    let v3: Vec<TokenStream> = udbdds
-        .iter()
-        .map(|bdd| {
-            let n = bdd.nodes_levelled().len();
-            let k = bdd.level_boundaries.len();
-            let mut node_buffer = String::new();
-            let mut lvl_bounds_buffer = String::new();
-            bdd.nodes_levelled().iter().for_each(|node| {
-                node_buffer.push_str(&format!(
-                    "Node::new({},{},{}),",
-                    node.input_index,
-                    node.high_index.unwrap_or_default(),
-                    node.low_index.unwrap_or_default()
-                ));
-            });
-            bdd.level_boundaries.iter().for_each(|v| {
-                lvl_bounds_buffer.push_str(&format!("{v},"));
-            });
-
-            parse_str(&format!(
-                "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}]))",
-                node_buffer, lvl_bounds_buffer
-            ))
-            .unwrap()
-        })
-        .collect();
-
-    let bdd_count = udbdds.len();
-
-    let p2 = quote! {
-        pub(crate) enum AnyBitCircuit {
-            #(#v0,)*
-        }
-
-        impl BitCircuitInfo for AnyBitCircuit {
-            fn info(&self) -> (&[Node], &[usize]) {
-                match self {
-                #(
-                    AnyBitCircuit::#v1(bit_circuit) => (
-                        bit_circuit.lvld_nodes.as_ref(),
-    bit_circuit.lvl_bounds.as_ref(),
-                    ),
-                )*
-                }
-            }
-        }
-
-        pub(crate) static OUTPUT_CIRCUITS: [AnyBitCircuit; #bdd_count] = [#(#v3,)*];
-    };
-
-    let output = quote! {
-        #p1
-        #p2
-    };
-
-    write(out_file, output.to_string()).expect("Unable to write to file");
+    // let p1 = quote! {
+    //     use super::super::{BitCircuitInfo, Node};
+    //
+    //     pub(super) struct BitCircuit<const N: usize, const K: usize> {
+    //         lvld_nodes: [Node; N],
+    //         lvl_bounds: [usize; K],
+    //     }
+    //
+    //     impl<const N: usize, const K: usize> BitCircuit<N, K> {
+    //         const fn new(lvld_nodes: [Node; N], lvl_bounds: [usize; K]) -> Self {
+    //             Self {
+    //                 lvld_nodes,
+    //                 lvl_bounds,
+    //             }
+    //         }
+    //     }
+    // };
+    //
+    // let (v0, v1): (Vec<TokenStream>, Vec<TokenStream>) = udbdds
+    //     .iter()
+    //     .map(|bdd| {
+    //         let n = bdd.nodes_levelled().len();
+    //         let k = bdd.level_boundaries.len();
+    //
+    //         (
+    //             parse_str(&format!("C{n}x{k}(BitCircuit<{n}, {k}>)")).unwrap(),
+    //             parse_str(&format!("C{n}x{k}")).unwrap(),
+    //         )
+    //     })
+    //     .collect::<Vec<(TokenStream, TokenStream)>>()
+    //     .into_iter()
+    //     .unzip();
+    //
+    // let v3: Vec<TokenStream> = udbdds
+    //     .iter()
+    //     .map(|bdd| {
+    //         let n = bdd.nodes_levelled().len();
+    //         let k = bdd.level_boundaries.len();
+    //         let mut node_buffer = String::new();
+    //         let mut lvl_bounds_buffer = String::new();
+    //         bdd.nodes_levelled().iter().for_each(|node| {
+    //             node_buffer.push_str(&format!(
+    //                 "Node::new({},{},{}),",
+    //                 node.input_index,
+    //                 node.high_index.unwrap_or_default(),
+    //                 node.low_index.unwrap_or_default()
+    //             ));
+    //         });
+    //         bdd.level_boundaries.iter().for_each(|v| {
+    //             lvl_bounds_buffer.push_str(&format!("{v},"));
+    //         });
+    //
+    //         parse_str(&format!(
+    //             "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}]))",
+    //             node_buffer, lvl_bounds_buffer
+    //         ))
+    //         .unwrap()
+    //     })
+    //     .collect();
+    //
+    // let bdd_count = udbdds.len();
+    //
+    // let p2 = quote! {
+    //     pub(crate) enum AnyBitCircuit {
+    //         #(#v0,)*
+    //     }
+    //
+    //     impl BitCircuitInfo for AnyBitCircuit {
+    //         fn info(&self) -> (&[Node], &[usize]) {
+    //             match self {
+    //             #(
+    //                 AnyBitCircuit::#v1(bit_circuit) => (
+    //                     bit_circuit.lvld_nodes.as_ref(),
+    // bit_circuit.lvl_bounds.as_ref(),
+    //                 ),
+    //             )*
+    //             }
+    //         }
+    //     }
+    //
+    //     pub(crate) static OUTPUT_CIRCUITS: [AnyBitCircuit; #bdd_count] = [#(#v3,)*];
+    // };
+    //
+    // let output = quote! {
+    //     #p1
+    //     #p2
+    // };
+    //
+    // write(out_file, output.to_string()).expect("Unable to write to file");
 }
 #[cfg(test)]
 mod tests {
 
     use std::{
+        io::Read,
         iter::zip,
         ops::{BitAnd, BitOr, BitXor},
     };
@@ -1407,15 +1477,24 @@ mod tests {
 
     #[test]
     fn test_add_and_sub() {
+        // FIXME(Jay): tests will fail for bits!=32 because add operation is defined as wrapping,
+        // not mod (1<<bits)
         let bits = 32;
 
         let (add_bdds, add_vars) = add(bits);
         let add_bdd_input_order = add_vars.variable_names();
         let add_input_order = adder_input_order(bits);
+
+        // let udbdd =
+        //     updown_bdd_from_bdd(&add_bdds[1], &add_vars, &add_input_order);
+        // println!("{}", udbdd);
         let add_udbdds = add_bdds
             .iter()
             .map(|b| updown_bdd_from_bdd(b, &add_vars, &add_input_order))
             .collect_vec();
+
+        println!("{}", add_bdds[bits-1].to_dot_string(&add_vars, false));
+        println!("Stats: {}", add_udbdds[bits-1].stats());
 
         let (sub_bdds, sub_vars) = sub(bits);
         let sub_bdd_input_order = sub_vars.variable_names();
@@ -1427,33 +1506,35 @@ mod tests {
 
         let bit_mask = bit_mask(bits);
 
-        for _ in 0..10 {
+        for _ in 0..100 {
             let a = rng().next_u32() & bit_mask;
             let b = rng().next_u32() & bit_mask;
 
             let input_bitstring = u32_to_bits(a)
                 .into_iter()
-                .chain(u32_to_bits(b))
+                .chain(u32_to_bits(b).into_iter())
                 .collect_vec();
             let input_ggsw =
                 input_bitstring.iter().map(|b| GGSW::from(*b)).collect_vec();
 
-            let add_out_ggsw = add_udbdds
-                .iter()
-                .map(|udb| execute(udb, &input_ggsw).value as u8)
-                .collect_vec();
-            let sub_out_ggsw = sub_udbdds
-                .iter()
-                .map(|udb| execute(udb, &input_ggsw).value as u8)
-                .collect_vec();
+            execute(&add_udbdds[1], &input_ggsw);
 
-            let add_have_ggsw = bits_to_u32(&add_out_ggsw);
-            let sub_have_ggsw = bits_to_u32(&sub_out_ggsw);
-            let add_want = a.wrapping_add(b);
-            let sub_want = a.wrapping_sub(b);
+        let add_out_ggsw = add_udbdds
+            .iter()
+            .map(|udb| execute(udb, &input_ggsw).value as u8)
+            .collect_vec();
+        let sub_out_ggsw = sub_udbdds
+            .iter()
+            .map(|udb| execute(udb, &input_ggsw).value as u8)
+            .collect_vec();
 
-            assert_eq!(add_want, add_have_ggsw);
-            assert_eq!(sub_want, sub_have_ggsw);
+        let add_have_ggsw = bits_to_u32(&add_out_ggsw);
+        let sub_have_ggsw = bits_to_u32(&sub_out_ggsw);
+        let add_want = a.wrapping_add(b);
+        let sub_want = a.wrapping_sub(b);
+
+        assert_eq!(add_want, add_have_ggsw, "want={:b}, have{:b}", add_want, add_have_ggsw);
+        assert_eq!(sub_want, sub_have_ggsw);
         }
     }
 
