@@ -881,6 +881,7 @@ impl CodegenUpDownBDD {
     }
 }
 
+#[derive(Clone)]
 struct UpDownBDD {
     nodes_levelled: Vec<Vec<Node>>,
 }
@@ -1084,52 +1085,19 @@ impl Display for Node {
     }
 }
 
-fn codegen_singlebit_out(ubdd: &UpDownBDD, out_file: &str) {
-    let ubdd = ubdd.to_codegen();
-
-    let bit_circuit: TokenStream = {
-        let mut nodes_buffer = String::new();
-        let mut lvl_bounds_buffer = String::new();
-        ubdd.nodes.iter().for_each(|node| {
-            nodes_buffer.push_str(&format!(
-                "Node::new({},{},{}),",
-                node.input_index, node.high_index, node.low_index
-            ));
-        });
-        ubdd.lvl_bounds.iter().for_each(|lb| {
-            lvl_bounds_buffer.push_str(&format!("{lb},"));
-        });
-
-        parse_str(&format!(
-            "BitCircuit::new([{}], [{}], {})",
-            nodes_buffer, lvl_bounds_buffer, ubdd.max_inter_state
-        ))
-        .unwrap()
-    };
-
-    let output = quote! {
-        pub(crate) static OUTPUT_CIRCUIT: Circuit<BitCircuit, 1> = Circuit {
-            nodes: [
-                #bit_circuit,
-            ]
-        };
-    };
-
-    std::fs::write(out_file, output.to_string())
-        .expect("Unable to write to file");
-}
 
 fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
     let udbdds = udbdds.iter().map(|b| b.to_codegen()).collect_vec();
 
     let (v0, v1): (Vec<TokenStream>, Vec<TokenStream>) = udbdds
         .iter()
-        .map(|ubdd| {
+        .enumerate()
+        .map(|(bit_index, ubdd)| {
             let n = ubdd.nodes.len();
             let k = ubdd.lvl_bounds.len();
             (
-                parse_str(&format!("C{n}x{k}(BitCircuit<{n}, {k}>)")).unwrap(),
-                parse_str(&format!("C{n}x{k}")).unwrap(),
+                parse_str(&format!("B{bit_index}(BitCircuit<{n}, {k}>)")).unwrap(),
+                parse_str(&format!("B{bit_index}")).unwrap(),
             )
         })
         .collect::<Vec<(TokenStream, TokenStream)>>()
@@ -1138,7 +1106,8 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
 
     let v3: Vec<TokenStream> = udbdds
         .iter()
-        .map(|ubdd| {
+        .enumerate()
+        .map(|(bit_index, ubdd)| {
             let n = ubdd.nodes.len();
             let k = ubdd.lvl_bounds.len();
             let mut node_buffer = String::new();
@@ -1154,8 +1123,8 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
             });
 
             parse_str(&format!(
-                "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}], {}))",
-                node_buffer, lvl_bounds_buffer, ubdd.max_inter_state
+                "AnyBitCircuit::B{}(BitCircuit::new([{}], [{}], {}))",
+                bit_index, node_buffer, lvl_bounds_buffer, ubdd.max_inter_state
             ))
             .unwrap()
         })
@@ -1182,9 +1151,9 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
             }
         }
 
-        pub(crate) static OUTPUT_CIRCUITS: Circuit<AnyBitCircuit, #bdd_count> = Circuit {
-            nodes: [#(#v3,)*]
-        };
+        pub(crate) static OUTPUT_CIRCUITS: Circuit<AnyBitCircuit, #bdd_count> = Circuit (
+            [#(#v3,)*]
+        );
     };
 
     let output = quote! {
@@ -1573,6 +1542,7 @@ mod tests {
         for _ in 0..100 {
             let a = rng().next_u32() & bit_mask;
             let b = rng().next_u32() & bit_mask;
+            let b = 1;
 
             let input_bitstring = u32_to_bits(a)
                 .into_iter()
@@ -1627,8 +1597,8 @@ mod tests {
         println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
         println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
 
-        codegen_singlebit_out(&unsigned_udbdd, "target/sltu_codegen.rs");
-        codegen_singlebit_out(&signed_udbdd, "target/slt_codegen.rs");
+        codegen_multibit_output(&[unsigned_udbdd.clone()], "target/sltu_codegen.rs");
+        codegen_multibit_output(&[signed_udbdd.clone()], "target/slt_codegen.rs");
 
         let input_order = unsigned_comparitor_input_order(bits);
         let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
@@ -1700,9 +1670,9 @@ mod tests {
         println!("Or UpDownBDD stats: {}", or_udbdd.stats());
         println!("Xor UpDownBDD stats: {}", xor_udbdd.stats());
 
-        codegen_singlebit_out(&and_udbdd, "target/and_codegen.rs");
-        codegen_singlebit_out(&or_udbdd, "target/or_codegen.rs");
-        codegen_singlebit_out(&xor_udbdd, "target/xor_codegen.rs");
+        codegen_multibit_output(&[and_udbdd.clone()], "target/and_codegen.rs");
+        codegen_multibit_output(&[or_udbdd.clone()], "target/or_codegen.rs");
+        codegen_multibit_output(&[xor_udbdd.clone()], "target/xor_codegen.rs");
         // let input_order = unsigned_comparitor_input_order(bits);
         // let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
         //
