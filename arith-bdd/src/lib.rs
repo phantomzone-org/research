@@ -864,22 +864,19 @@ fn updown_bdd_from_bdd(
 struct CodegenUpDownBDD {
     nodes: Vec<Node>,
     lvl_bounds: Vec<usize>,
-    max_even_inter_state: usize,
-    max_odd_inter_state: usize,
+    max_inter_state: usize,
 }
 
 impl CodegenUpDownBDD {
     fn new(
         nodes: Vec<Node>,
         lvl_bounds: Vec<usize>,
-        max_even_inter_state: usize,
-        max_odd_inter_state: usize,
+        max_inter_state: usize,
     ) -> Self {
         CodegenUpDownBDD {
             nodes,
             lvl_bounds,
-            max_even_inter_state,
-            max_odd_inter_state,
+            max_inter_state,
         }
     }
 }
@@ -924,30 +921,18 @@ impl UpDownBDD {
         let mut nodes = vec![];
         // starts the boundry at which the i^th level starts
         let mut lvl_bounds = vec![0];
-        let mut max_even_inter_state = 0;
-        let mut max_odd_inter_state = 0;
+        let mut max_inter_state = 2;
 
-        for (index, lvl_nodes) in self.nodes_levelled().iter().enumerate() {
+        for lvl_nodes in self.nodes_levelled() {
             nodes.extend_from_slice(lvl_nodes.as_slice());
             lvl_bounds.push(lvl_bounds.last().unwrap() + lvl_nodes.len());
 
-            if index & 1 == 1 {
-                max_even_inter_state =
-                    std::cmp::max(max_even_inter_state, lvl_nodes.len());
-            } else {
-                max_odd_inter_state =
-                    std::cmp::max(max_odd_inter_state, lvl_nodes.len());
-            }
+            max_inter_state = std::cmp::max(max_inter_state, lvl_nodes.len());
         }
 
         lvl_bounds.pop();
 
-        CodegenUpDownBDD::new(
-            nodes,
-            lvl_bounds,
-            max_even_inter_state,
-            max_odd_inter_state,
-        )
+        CodegenUpDownBDD::new(nodes, lvl_bounds, max_inter_state)
     }
 
     fn stats(&self) -> String {
@@ -1029,7 +1014,8 @@ fn cmux(selector: &GGSW, if_true: &GLWECt, if_false: &GLWECt) -> GLWECt {
 }
 
 fn execute(bdd: &UpDownBDD, inputs: &[GGSW]) -> GLWECt {
-    let mut out = vec![GLWECt::default(); bdd.max_intermediate_storage()];
+    let mut out = vec![GLWECt::default(); bdd.to_codegen().max_inter_state];
+
     out[0] = GLWECt::new(0);
     out[1] = GLWECt::new(1);
 
@@ -1101,8 +1087,6 @@ impl Display for Node {
 fn codegen_singlebit_out(ubdd: &UpDownBDD, out_file: &str) {
     let ubdd = ubdd.to_codegen();
 
-    let node_count = ubdd.nodes.len();
-    let lvl_b_count = ubdd.lvl_bounds.len();
     let bit_circuit: TokenStream = {
         let mut nodes_buffer = String::new();
         let mut lvl_bounds_buffer = String::new();
@@ -1117,11 +1101,8 @@ fn codegen_singlebit_out(ubdd: &UpDownBDD, out_file: &str) {
         });
 
         parse_str(&format!(
-            "BitCircuit::new([{}], [{}], [{}, {}])",
-            nodes_buffer,
-            lvl_bounds_buffer,
-            ubdd.max_even_inter_state,
-            ubdd.max_odd_inter_state
+            "BitCircuit::new([{}], [{}], {})",
+            nodes_buffer, lvl_bounds_buffer, ubdd.max_inter_state
         ))
         .unwrap()
     };
@@ -1173,8 +1154,8 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
             });
 
             parse_str(&format!(
-                "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}], [{}, {}]))",
-                node_buffer, lvl_bounds_buffer, ubdd.max_even_inter_state, ubdd.max_odd_inter_state
+                "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}], {}))",
+                node_buffer, lvl_bounds_buffer, ubdd.max_inter_state
             ))
             .unwrap()
         })
@@ -1188,13 +1169,13 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
         }
 
         impl BitCircuitInfo for AnyBitCircuit {
-            fn info(&self) -> (&[Node], &[usize], &[usize]) {
+            fn info(&self) -> (&[Node], &[usize], usize) {
                 match self {
                 #(
                     AnyBitCircuit::#v1(bit_circuit) => (
                         bit_circuit.nodes.as_ref(),
                         bit_circuit.levels.as_ref(),
-                        bit_circuit.max_inter_state.as_ref()
+                        bit_circuit.max_inter_state
                     ),
                 )*
                 }
