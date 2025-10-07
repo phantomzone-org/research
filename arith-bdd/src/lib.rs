@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt::write;
 use std::{fmt::Display, iter};
 // use petgraph::dot::dot_parser::
 use biodivine_lib_bdd::*;
@@ -647,6 +646,7 @@ fn levels_for_graph(graph: &Graph<&str, i32>) -> HashMap<NodeIndex, usize> {
     level_map
 }
 
+// input_order: order of the variables as expected in the input array at evaluation
 fn updown_bdd_from_bdd(
     bdd: &Bdd,
     vars: &BddVariableSet,
@@ -661,7 +661,7 @@ fn updown_bdd_from_bdd(
         );
     }
 
-    // BDD upside down
+    // Invert the BDD
     let mut graph = DiGraph::new();
     // Bdd pointer index -> NodeIndex
     let mut bdd_index_to_node_index = HashMap::new();
@@ -704,7 +704,7 @@ fn updown_bdd_from_bdd(
     // let dot = Dot::with_config(&graph, &[]).to_string();
     // println!("{}", dot);
 
-    // create upside BDD repr. for our purpose
+    // create UpDownBDD instance //
     let node_index_to_lvl = levels_for_graph(&graph);
     // println!("Node levels = {:?}", node_index_to_lvl);
 
@@ -763,21 +763,55 @@ fn updown_bdd_from_bdd(
     assert!(outputs_set.is_empty());
 
     let mut nodes_lvld = vec![];
+    let mut input_state = vec![(terminal_node0, 0), (terminal_node1, 1)];
     for lvl in 1..max_level + 1 {
         let mut curr_lvl = vec![];
 
         let sorted_nodes = node_index_to_lvl
             .iter()
             .filter(|(n, v)| **v == lvl)
-            .sorted_by(|(a, _), (b, _)| {
-                Ord::cmp(
-                    node_pos_all_lvls.get(*a).unwrap(),
-                    node_pos_all_lvls.get(*b).unwrap(),
-                )
-            })
+            // map (NodeIndex, lvl) -> (NodeIndex, Output pos)
+            .map(|a| (*a.0, node_pos_all_lvls.get(a.0).unwrap().clone()))
+            .sorted_by(|(_, a_pos), (_, b_pos)| Ord::cmp(a_pos, b_pos))
             .collect_vec();
 
-        sorted_nodes.into_iter().for_each(|(node_i, output_index)| {
+        // At any level certain input nodes in input state, when they are required at another
+        // deeper level, are copied to the ouput state at the same position. In such cases, the
+        // output state position of outputs at the current level are offsetted accordingly. Below
+        // we insert the nodes that are copied from the input in the output state, then insert
+        // outputs of the current level in the output state.
+
+        // drop all nodes from input state starting from output pos of the first output node
+        input_state.truncate(sorted_nodes[0].1);
+
+        input_state.iter().for_each(|(n, pos)| {
+            if n == &terminal_node1 || n == &terminal_node0 {
+                // terminal nodes are not actual nodes
+                // use any input index because it's not used when input state is copied over
+
+                curr_lvl.push(Node::new(
+                    "terminal".to_string(),
+                    *n,
+                    *pos,
+                    *pos,
+                    *pos,
+                    0,
+                ));
+            } else {
+                let node_weight = graph.node_weight(*n).unwrap().to_string();
+                let input_index =
+                    input_order.iter().position(|t| &node_weight == t).unwrap();
+                curr_lvl.push(Node::new(
+                    node_weight,
+                    *n,
+                    *pos,
+                    *pos,
+                    *pos,
+                    input_index,
+                ));
+            }
+        });
+        sorted_nodes.iter().for_each(|(node_i, output_pos)| {
             let node_weight = graph.node_weight(*node_i).unwrap().to_string();
             let high_index = node_pos_all_lvls
                 .get(
@@ -797,13 +831,15 @@ fn updown_bdd_from_bdd(
                         .source(),
                 )
                 .unwrap();
+            // Find the index of the node in the input array fed for evaluation using
+            // the tag assigned to the node by BDD ( i.e. variable name )
             let input_index =
                 input_order.iter().position(|t| &node_weight == t).unwrap();
 
             curr_lvl.push(Node::new(
                 node_weight,
                 *node_i,
-                *node_pos_all_lvls.get(node_i).unwrap(),
+                *output_pos,
                 *high_index,
                 *low_index,
                 input_index,
@@ -811,9 +847,41 @@ fn updown_bdd_from_bdd(
         });
 
         nodes_lvld.push(curr_lvl);
+
+        // insert output nodes of current level to input state of the next
+        sorted_nodes.iter().for_each(|v| {
+            // sanity check
+            assert_eq!(input_state.len(), v.1);
+            input_state.push(*v);
+        });
     }
 
+    assert_eq!(input_state.len(), 1);
+
     return UpDownBDD::new(nodes_lvld);
+}
+
+struct CodegenUpDownBDD {
+    nodes: Vec<Node>,
+    lvl_bounds: Vec<usize>,
+    max_even_inter_state: usize,
+    max_odd_inter_state: usize,
+}
+
+impl CodegenUpDownBDD {
+    fn new(
+        nodes: Vec<Node>,
+        lvl_bounds: Vec<usize>,
+        max_even_inter_state: usize,
+        max_odd_inter_state: usize,
+    ) -> Self {
+        CodegenUpDownBDD {
+            nodes,
+            lvl_bounds,
+            max_even_inter_state,
+            max_odd_inter_state,
+        }
+    }
 }
 
 struct UpDownBDD {
@@ -848,7 +916,38 @@ impl UpDownBDD {
                 counter = std::cmp::max(counter, n.output_pos);
             }
         }
-        counter + 1
+        // minimum 2 for terminal nodes
+        std::cmp::max(counter + 1, 2)
+    }
+
+    fn to_codegen(&self) -> CodegenUpDownBDD {
+        let mut nodes = vec![];
+        // starts the boundry at which the i^th level starts
+        let mut lvl_bounds = vec![0];
+        let mut max_even_inter_state = 0;
+        let mut max_odd_inter_state = 0;
+
+        for (index, lvl_nodes) in self.nodes_levelled().iter().enumerate() {
+            nodes.extend_from_slice(lvl_nodes.as_slice());
+            lvl_bounds.push(lvl_bounds.last().unwrap() + lvl_nodes.len());
+
+            if index & 1 == 1 {
+                max_even_inter_state =
+                    std::cmp::max(max_even_inter_state, lvl_nodes.len());
+            } else {
+                max_odd_inter_state =
+                    std::cmp::max(max_odd_inter_state, lvl_nodes.len());
+            }
+        }
+
+        lvl_bounds.pop();
+
+        CodegenUpDownBDD::new(
+            nodes,
+            lvl_bounds,
+            max_even_inter_state,
+            max_odd_inter_state,
+        )
     }
 
     fn stats(&self) -> String {
@@ -936,20 +1035,25 @@ fn execute(bdd: &UpDownBDD, inputs: &[GGSW]) -> GLWECt {
 
     for (lvl_i, lvl_nodes) in bdd.nodes_levelled().iter().enumerate() {
         let out_old = out.clone();
-        for node in lvl_nodes {
+        for (out_pos, node) in lvl_nodes.iter().enumerate() {
+            assert!(out_pos == node.output_pos);
             // println!("Node={:?} level={}", node, lvl_i);
-            let o = cmux(
-                &inputs[node.input_index],
-                &out_old[node.high_index],
-                &out_old[node.low_index],
-            );
-            out[node.output_pos] = o;
+            let o = if node.high_index == node.low_index {
+                out_old[out_pos].clone()
+            } else {
+                cmux(
+                    &inputs[node.input_index],
+                    &out_old[node.high_index],
+                    &out_old[node.low_index],
+                )
+            };
+            out[out_pos] = o;
         }
     }
     out[0].clone()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Node {
     tag: String,
     // Store NodeIndex for debugging purposes
@@ -995,153 +1099,122 @@ impl Display for Node {
 }
 
 fn codegen_singlebit_out(ubdd: &UpDownBDD, out_file: &str) {
-    // let p1 = quote! {
-    //     use super::super::{BitCircuitInfo, Node};
-    //
-    //     pub(crate) struct BitCircuit<const N: usize, const K: usize> {
-    //        pub(crate) lvld_nodes: [Node; N],
-    //        pub(crate) lvl_bounds: [usize; K],
-    //     }
-    //
-    //     impl<const N: usize, const K: usize> BitCircuit<N, K> {
-    //         const fn new(lvld_nodes: [Node; N], lvl_bounds: [usize; K]) -> Self {
-    //             Self {
-    //                 lvld_nodes,
-    //                 lvl_bounds,
-    //             }
-    //         }
-    //     }
-    //     impl<const N: usize, const K: usize> BitCircuitInfo for BitCircuit<N, K> {
-    //         fn info(&self) -> (&[Node], &[usize]) {
-    //             (self.lvld_nodes.as_ref(), self.lvl_bounds.as_ref())
-    //         }
-    //     }
-    // };
-    //
-    // let node_count = ubdd.nodes_levelled().len();
-    // let lvl_b_count = ubdd.level_boundaries.len();
-    // let bit_circuit: TokenStream = {
-    //     let mut nodes_buffer = String::new();
-    //     let mut lvl_bounds_buffer = String::new();
-    //     ubdd.nodes_levelled().iter().for_each(|node| {
-    //         nodes_buffer.push_str(&format!(
-    //             "Node::new({},{},{}),",
-    //             node.input_index,
-    //             node.high_index.unwrap_or_default(),
-    //             node.low_index.unwrap_or_default()
-    //         ));
-    //     });
-    //     ubdd.level_boundaries.iter().for_each(|lb| {
-    //         lvl_bounds_buffer.push_str(&format!("{lb},"));
-    //     });
-    //
-    //     parse_str(&format!(
-    //         "BitCircuit::new([{}], [{}])",
-    //         nodes_buffer, lvl_bounds_buffer
-    //     ))
-    //     .unwrap()
-    // };
-    //
-    // let output = quote! {
-    //     #p1
-    //
-    //     pub(crate) static OUTPUT_CIRCUIT: BitCircuit<#node_count, #lvl_b_count> = #bit_circuit;
-    // };
-    //
-    // write(out_file, output.to_string()).expect("Unable to write to file");
+    let ubdd = ubdd.to_codegen();
+
+    let node_count = ubdd.nodes.len();
+    let lvl_b_count = ubdd.lvl_bounds.len();
+    let bit_circuit: TokenStream = {
+        let mut nodes_buffer = String::new();
+        let mut lvl_bounds_buffer = String::new();
+        ubdd.nodes.iter().for_each(|node| {
+            nodes_buffer.push_str(&format!(
+                "Node::new({},{},{}),",
+                node.input_index, node.high_index, node.low_index
+            ));
+        });
+        ubdd.lvl_bounds.iter().for_each(|lb| {
+            lvl_bounds_buffer.push_str(&format!("{lb},"));
+        });
+
+        parse_str(&format!(
+            "BitCircuit::new([{}], [{}], [{}, {}])",
+            nodes_buffer,
+            lvl_bounds_buffer,
+            ubdd.max_even_inter_state,
+            ubdd.max_odd_inter_state
+        ))
+        .unwrap()
+    };
+
+    let output = quote! {
+        pub(crate) static OUTPUT_CIRCUIT: Circuit<BitCircuit, 1> = Circuit {
+            nodes: [
+                #bit_circuit,
+            ]
+        };
+    };
+
+    std::fs::write(out_file, output.to_string())
+        .expect("Unable to write to file");
 }
 
 fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
-    // let p1 = quote! {
-    //     use super::super::{BitCircuitInfo, Node};
-    //
-    //     pub(super) struct BitCircuit<const N: usize, const K: usize> {
-    //         lvld_nodes: [Node; N],
-    //         lvl_bounds: [usize; K],
-    //     }
-    //
-    //     impl<const N: usize, const K: usize> BitCircuit<N, K> {
-    //         const fn new(lvld_nodes: [Node; N], lvl_bounds: [usize; K]) -> Self {
-    //             Self {
-    //                 lvld_nodes,
-    //                 lvl_bounds,
-    //             }
-    //         }
-    //     }
-    // };
-    //
-    // let (v0, v1): (Vec<TokenStream>, Vec<TokenStream>) = udbdds
-    //     .iter()
-    //     .map(|bdd| {
-    //         let n = bdd.nodes_levelled().len();
-    //         let k = bdd.level_boundaries.len();
-    //
-    //         (
-    //             parse_str(&format!("C{n}x{k}(BitCircuit<{n}, {k}>)")).unwrap(),
-    //             parse_str(&format!("C{n}x{k}")).unwrap(),
-    //         )
-    //     })
-    //     .collect::<Vec<(TokenStream, TokenStream)>>()
-    //     .into_iter()
-    //     .unzip();
-    //
-    // let v3: Vec<TokenStream> = udbdds
-    //     .iter()
-    //     .map(|bdd| {
-    //         let n = bdd.nodes_levelled().len();
-    //         let k = bdd.level_boundaries.len();
-    //         let mut node_buffer = String::new();
-    //         let mut lvl_bounds_buffer = String::new();
-    //         bdd.nodes_levelled().iter().for_each(|node| {
-    //             node_buffer.push_str(&format!(
-    //                 "Node::new({},{},{}),",
-    //                 node.input_index,
-    //                 node.high_index.unwrap_or_default(),
-    //                 node.low_index.unwrap_or_default()
-    //             ));
-    //         });
-    //         bdd.level_boundaries.iter().for_each(|v| {
-    //             lvl_bounds_buffer.push_str(&format!("{v},"));
-    //         });
-    //
-    //         parse_str(&format!(
-    //             "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}]))",
-    //             node_buffer, lvl_bounds_buffer
-    //         ))
-    //         .unwrap()
-    //     })
-    //     .collect();
-    //
-    // let bdd_count = udbdds.len();
-    //
-    // let p2 = quote! {
-    //     pub(crate) enum AnyBitCircuit {
-    //         #(#v0,)*
-    //     }
-    //
-    //     impl BitCircuitInfo for AnyBitCircuit {
-    //         fn info(&self) -> (&[Node], &[usize]) {
-    //             match self {
-    //             #(
-    //                 AnyBitCircuit::#v1(bit_circuit) => (
-    //                     bit_circuit.lvld_nodes.as_ref(),
-    // bit_circuit.lvl_bounds.as_ref(),
-    //                 ),
-    //             )*
-    //             }
-    //         }
-    //     }
-    //
-    //     pub(crate) static OUTPUT_CIRCUITS: [AnyBitCircuit; #bdd_count] = [#(#v3,)*];
-    // };
-    //
-    // let output = quote! {
-    //     #p1
-    //     #p2
-    // };
-    //
-    // write(out_file, output.to_string()).expect("Unable to write to file");
+    let udbdds = udbdds.iter().map(|b| b.to_codegen()).collect_vec();
+
+    let (v0, v1): (Vec<TokenStream>, Vec<TokenStream>) = udbdds
+        .iter()
+        .map(|ubdd| {
+            let n = ubdd.nodes.len();
+            let k = ubdd.lvl_bounds.len();
+            (
+                parse_str(&format!("C{n}x{k}(BitCircuit<{n}, {k}>)")).unwrap(),
+                parse_str(&format!("C{n}x{k}")).unwrap(),
+            )
+        })
+        .collect::<Vec<(TokenStream, TokenStream)>>()
+        .into_iter()
+        .unzip();
+
+    let v3: Vec<TokenStream> = udbdds
+        .iter()
+        .map(|ubdd| {
+            let n = ubdd.nodes.len();
+            let k = ubdd.lvl_bounds.len();
+            let mut node_buffer = String::new();
+            let mut lvl_bounds_buffer = String::new();
+            ubdd.nodes.iter().for_each(|node| {
+                node_buffer.push_str(&format!(
+                    "Node::new({},{},{}),",
+                    node.input_index, node.high_index, node.low_index
+                ));
+            });
+            ubdd.lvl_bounds.iter().for_each(|v| {
+                lvl_bounds_buffer.push_str(&format!("{v},"));
+            });
+
+            parse_str(&format!(
+                "AnyBitCircuit::C{n}x{k}(BitCircuit::new([{}], [{}], [{}, {}]))",
+                node_buffer, lvl_bounds_buffer, ubdd.max_even_inter_state, ubdd.max_odd_inter_state
+            ))
+            .unwrap()
+        })
+        .collect();
+
+    let bdd_count = udbdds.len();
+
+    let p2 = quote! {
+        pub(crate) enum AnyBitCircuit {
+            #(#v0,)*
+        }
+
+        impl BitCircuitInfo for AnyBitCircuit {
+            fn info(&self) -> (&[Node], &[usize], &[usize]) {
+                match self {
+                #(
+                    AnyBitCircuit::#v1(bit_circuit) => (
+                        bit_circuit.nodes.as_ref(),
+                        bit_circuit.levels.as_ref(),
+                        bit_circuit.max_inter_state.as_ref()
+                    ),
+                )*
+                }
+            }
+        }
+
+        pub(crate) static OUTPUT_CIRCUITS: Circuit<AnyBitCircuit, #bdd_count> = Circuit {
+            nodes: [#(#v3,)*]
+        };
+    };
+
+    let output = quote! {
+        use crate::tfhe::bdd_arithmetic::{BitCircuit, BitCircuitInfo, Circuit, Node};
+
+        #p2
+    };
+    std::fs::write(out_file, output.to_string())
+        .expect("Unable to write to file");
 }
+
 #[cfg(test)]
 mod tests {
 
@@ -1477,14 +1550,13 @@ mod tests {
 
     #[test]
     fn test_add_and_sub() {
-        // FIXME(Jay): tests will fail for bits!=32 because add operation is defined as wrapping,
+        // TODO: (jay) tests will fail for bits!=32 because add operation is defined as wrapping,
         // not mod (1<<bits)
         let bits = 32;
 
         let (add_bdds, add_vars) = add(bits);
         let add_bdd_input_order = add_vars.variable_names();
         let add_input_order = adder_input_order(bits);
-
         // let udbdd =
         //     updown_bdd_from_bdd(&add_bdds[1], &add_vars, &add_input_order);
         // println!("{}", udbdd);
@@ -1493,9 +1565,6 @@ mod tests {
             .map(|b| updown_bdd_from_bdd(b, &add_vars, &add_input_order))
             .collect_vec();
 
-        println!("{}", add_bdds[bits-1].to_dot_string(&add_vars, false));
-        println!("Stats: {}", add_udbdds[bits-1].stats());
-
         let (sub_bdds, sub_vars) = sub(bits);
         let sub_bdd_input_order = sub_vars.variable_names();
         let sub_input_order = adder_input_order(bits);
@@ -1503,6 +1572,20 @@ mod tests {
             .iter()
             .map(|b| updown_bdd_from_bdd(b, &sub_vars, &sub_input_order))
             .collect_vec();
+
+        println!(
+            "Add: {}",
+            add_bdds[bits - 1].to_dot_string(&add_vars, false)
+        );
+        println!("Add: Stats: {}", add_udbdds[bits - 1].stats());
+        println!(
+            "Sub: {}",
+            sub_bdds[bits - 1].to_dot_string(&add_vars, false)
+        );
+        println!("Sub: Stats: {}", sub_udbdds[bits - 1].stats());
+
+        codegen_multibit_output(&add_udbdds, "target/add_codegen.rs");
+        codegen_multibit_output(&sub_udbdds, "target/sub_codegen.rs");
 
         let bit_mask = bit_mask(bits);
 
@@ -1519,90 +1602,27 @@ mod tests {
 
             execute(&add_udbdds[1], &input_ggsw);
 
-        let add_out_ggsw = add_udbdds
-            .iter()
-            .map(|udb| execute(udb, &input_ggsw).value as u8)
-            .collect_vec();
-        let sub_out_ggsw = sub_udbdds
-            .iter()
-            .map(|udb| execute(udb, &input_ggsw).value as u8)
-            .collect_vec();
+            let add_out_ggsw = add_udbdds
+                .iter()
+                .map(|udb| execute(udb, &input_ggsw).value as u8)
+                .collect_vec();
+            let sub_out_ggsw = sub_udbdds
+                .iter()
+                .map(|udb| execute(udb, &input_ggsw).value as u8)
+                .collect_vec();
 
-        let add_have_ggsw = bits_to_u32(&add_out_ggsw);
-        let sub_have_ggsw = bits_to_u32(&sub_out_ggsw);
-        let add_want = a.wrapping_add(b);
-        let sub_want = a.wrapping_sub(b);
+            let add_have_ggsw = bits_to_u32(&add_out_ggsw);
+            let sub_have_ggsw = bits_to_u32(&sub_out_ggsw);
+            let add_want = a.wrapping_add(b);
+            let sub_want = a.wrapping_sub(b);
 
-        assert_eq!(add_want, add_have_ggsw, "want={:b}, have{:b}", add_want, add_have_ggsw);
-        assert_eq!(sub_want, sub_have_ggsw);
+            assert_eq!(
+                add_want, add_have_ggsw,
+                "want={:b}, have{:b}",
+                add_want, add_have_ggsw
+            );
+            assert_eq!(sub_want, sub_have_ggsw);
         }
-    }
-
-    #[test]
-    fn test_add_sub() {
-        let bits = 32;
-        let (bdds, vars) = add_sub(bits);
-        let bdd_input_order = vars.variable_names();
-        let input_order = add_sub_input_order(bits);
-        let udbdds = bdds
-            .iter()
-            .map(|b| updown_bdd_from_bdd(b, &vars, &input_order))
-            .collect_vec();
-
-        println!("{}", bdds[bits - 1].to_dot_string(&vars, false));
-        println!("Stats: {}", udbdds[bits - 1].stats());
-
-        let bit_mask = bit_mask(bits);
-
-        for _ in 0..10 {
-            let a = rng().next_u32() & bit_mask;
-            let b = rng().next_u32() & bit_mask;
-
-            [0u8, 1].iter().for_each(|s| {
-                let input_bitstring = vec![*s]
-                    .into_iter()
-                    .chain(u32_to_bits(a).into_iter())
-                    .chain(u32_to_bits(b))
-                    .collect_vec();
-                let input_ggsw = input_bitstring
-                    .iter()
-                    .map(|b| GGSW::from(*b))
-                    .collect_vec();
-
-                let out_ggsw = udbdds
-                    .iter()
-                    .map(|udb| execute(udb, &input_ggsw).value as u8)
-                    .collect_vec();
-
-                let have_ggsw = bits_to_u32(&out_ggsw);
-                let want = if *s == 0 {
-                    a.wrapping_add(b)
-                } else {
-                    a.wrapping_sub(b)
-                };
-
-                assert_eq!(want, have_ggsw);
-            });
-        }
-    }
-
-    #[test]
-    fn test_comparitors_combined() {
-        let bits = 32;
-        let (bdd, vars) = combined_comparitor_circuit(bits);
-        println!("{}", bdd.to_dot_string(&vars, false));
-
-        let input_order: Vec<String> = vec!["s".to_string()]
-            .into_iter()
-            .chain(
-                (0..bits)
-                    .map(|i| format!("a{}", i))
-                    .chain((0..bits).map(|i| format!("b{}", i))),
-            )
-            .collect();
-
-        let udbdd = updown_bdd_from_bdd(&bdd, &vars, &input_order);
-        println!("Stats = {}", udbdd.stats());
     }
 
     #[test]
@@ -1633,7 +1653,7 @@ mod tests {
         let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
 
         let bit_mask = bit_mask(bits);
-        for _ in 0..20 {
+        for _ in 0..100 {
             let a = rng().next_u32() & bit_mask;
             let b = rng().next_u32() & bit_mask;
 
@@ -1732,59 +1752,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shifts_combined() {
-        let bits = 32;
-        let shift_bits = 5;
-        let (bdds, vars) = shift_circuit_combined(bits, shift_bits);
-        // let input_order = shift_circuit_combined_input_order(bits, shift_bits);
-        // let udbdds = bdds.iter().map(|b| updown_bdd_from_bdd(b, &vars, &input_order)).collect_vec();
-        println!("{}", bdds[bits - 1].to_dot_string(&vars, false));
-
-        for (op_type, (s0, s1)) in [
-            (ShiftOp::SLL, (0, 0)),
-            (ShiftOp::SRL, (0, 1)),
-            (ShiftOp::SRA, (1, 1)),
-        ] {
-            for value in rng().random_iter::<u32>().take(1000) {
-                for shift in 0..1 << shift_bits {
-                    let inputs_bool: Vec<bool> = (0..shift_bits)
-                        .map(|i| (shift >> i) & 1 == 1)
-                        .chain(vec![s0 == 1, s1 == 1].into_iter())
-                        .chain((0..bits).map(|i| (value >> i) & 1 == 1))
-                        .collect();
-                    // println!("Input={:?}", &inputs_bool);
-
-                    let out_bdd: Vec<bool> = bdds
-                        .iter()
-                        .map(|bdd| {
-                            bdd.eval_in(&BddValuation::new(inputs_bool.clone()))
-                        })
-                        .collect();
-                    // println!("Out {:?}", &out_bdd.len());
-                    let have_out = out_bdd
-                        .iter()
-                        .enumerate()
-                        .fold(0u32, |res, (index, b)| {
-                            res + ((*b as u32) << index)
-                        });
-
-                    let want_out = match op_type {
-                        ShiftOp::SLL => value << shift,
-                        ShiftOp::SRL => value >> shift,
-                        ShiftOp::SRA => ((value as i32) >> (shift)) as u32,
-                    };
-
-                    assert_eq!(
-                        have_out, want_out,
-                        "Failed at {:#32b} {:?} {shift}. have_out={:#32b}, want_out={:#32b}",
-                        value, op_type, have_out, want_out
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn test_shift_ops() {
         let bits = 32;
         let shift_bits = 5;
@@ -1815,16 +1782,15 @@ mod tests {
                     )
                 })
                 .collect();
+            println!("{}", udbdds[index_most_expensive].stats());
+            // udbdds.iter().for_each(|udbb| {
+            //     println!("{}", udbb.stats());
+            // });
 
             codegen_multibit_output(
                 &udbdds,
                 &format!("target/{}_codegen.rs", op_type),
             );
-
-            println!("{}", udbdds[index_most_expensive].stats());
-            // udbdds.iter().for_each(|udbb| {
-            //     println!("{}", udbb.stats());
-            // });
 
             for value in rng().random_iter::<u32>().take(1000) {
                 for shift in 0..1 << shift_bits {
@@ -1902,4 +1868,125 @@ mod tests {
             (1u32 << bits) - 1
         }
     }
+
+    //TODO: (jay) tests for combined circuits that are not needed at the moment.
+    //
+    // #[test]
+    // fn test_comparitors_combined() {
+    //     let bits = 32;
+    //     let (bdd, vars) = combined_comparitor_circuit(bits);
+    //     println!("{}", bdd.to_dot_string(&vars, false));
+    //
+    //     let input_order: Vec<String> = vec!["s".to_string()]
+    //         .into_iter()
+    //         .chain(
+    //             (0..bits)
+    //                 .map(|i| format!("a{}", i))
+    //                 .chain((0..bits).map(|i| format!("b{}", i))),
+    //         )
+    //         .collect();
+    //
+    //     let udbdd = updown_bdd_from_bdd(&bdd, &vars, &input_order);
+    //     // println!("Stats = {}", udbdd.stats());
+    // }
+    //
+    // #[test]
+    // fn test_shifts_combined() {
+    //     let bits = 32;
+    //     let shift_bits = 5;
+    //     let (bdds, vars) = shift_circuit_combined(bits, shift_bits);
+    //     // let input_order = shift_circuit_combined_input_order(bits, shift_bits);
+    //     // let udbdds = bdds.iter().map(|b| updown_bdd_from_bdd(b, &vars, &input_order)).collect_vec();
+    //     println!("{}", bdds[bits - 1].to_dot_string(&vars, false));
+    //
+    //     for (op_type, (s0, s1)) in [
+    //         (ShiftOp::SLL, (0, 0)),
+    //         (ShiftOp::SRL, (0, 1)),
+    //         (ShiftOp::SRA, (1, 1)),
+    //     ] {
+    //         for value in rng().random_iter::<u32>().take(1000) {
+    //             for shift in 0..1 << shift_bits {
+    //                 let inputs_bool: Vec<bool> = (0..shift_bits)
+    //                     .map(|i| (shift >> i) & 1 == 1)
+    //                     .chain(vec![s0 == 1, s1 == 1].into_iter())
+    //                     .chain((0..bits).map(|i| (value >> i) & 1 == 1))
+    //                     .collect();
+    //                 // println!("Input={:?}", &inputs_bool);
+    //
+    //                 let out_bdd: Vec<bool> = bdds
+    //                     .iter()
+    //                     .map(|bdd| {
+    //                         bdd.eval_in(&BddValuation::new(inputs_bool.clone()))
+    //                     })
+    //                     .collect();
+    //                 // println!("Out {:?}", &out_bdd.len());
+    //                 let have_out = out_bdd
+    //                     .iter()
+    //                     .enumerate()
+    //                     .fold(0u32, |res, (index, b)| {
+    //                         res + ((*b as u32) << index)
+    //                     });
+    //
+    //                 let want_out = match op_type {
+    //                     ShiftOp::SLL => value << shift,
+    //                     ShiftOp::SRL => value >> shift,
+    //                     ShiftOp::SRA => ((value as i32) >> (shift)) as u32,
+    //                 };
+    //
+    //                 assert_eq!(
+    //                     have_out, want_out,
+    //                     "Failed at {:#32b} {:?} {shift}. have_out={:#32b}, want_out={:#32b}",
+    //                     value, op_type, have_out, want_out
+    //                 );
+    //             }
+    //         }
+    //     }
+    // }
+    // #[test]
+    // fn test_add_sub() {
+    //     let bits = 32;
+    //     let (bdds, vars) = add_sub(bits);
+    //     let bdd_input_order = vars.variable_names();
+    //     let input_order = add_sub_input_order(bits);
+    //     let udbdds = bdds
+    //         .iter()
+    //         .map(|b| updown_bdd_from_bdd(b, &vars, &input_order))
+    //         .collect_vec();
+    //
+    //     println!("{}", bdds[bits - 1].to_dot_string(&vars, false));
+    //     println!("Stats: {}", udbdds[bits - 1].stats());
+    //
+    //     let bit_mask = bit_mask(bits);
+    //
+    //     for _ in 0..100 {
+    //         let a = rng().next_u32() & bit_mask;
+    //         let b = rng().next_u32() & bit_mask;
+    //
+    //         [0u8, 1].iter().for_each(|s| {
+    //             let input_bitstring = vec![*s]
+    //                 .into_iter()
+    //                 .chain(u32_to_bits(a).into_iter())
+    //                 .chain(u32_to_bits(b))
+    //                 .collect_vec();
+    //             let input_ggsw = input_bitstring
+    //                 .iter()
+    //                 .map(|b| GGSW::from(*b))
+    //                 .collect_vec();
+    //
+    //             let out_ggsw = udbdds
+    //                 .iter()
+    //                 .map(|udb| execute(udb, &input_ggsw).value as u8)
+    //                 .collect_vec();
+    //
+    //             let have_ggsw = bits_to_u32(&out_ggsw);
+    //             let want = if *s == 0 {
+    //                 a.wrapping_add(b)
+    //             } else {
+    //                 a.wrapping_sub(b)
+    //             };
+    //
+    //             assert_eq!(want, have_ggsw);
+    //         });
+    //     }
+    // }
 }
