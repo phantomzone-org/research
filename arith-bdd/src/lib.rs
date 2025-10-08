@@ -68,6 +68,19 @@ use syn::parse_str;
 // which will restrict its jumps to +/- 2Kib. We'll have to investigate this furter.
 //
 // For now, PC update circuit assumes 20 bit immediates for all operations.
+//
+//
+// Notes in risc-v:
+// 1. Register-Immediate Integer instructions have 12 bit imm.
+// 2. Operation LUI, takes 20 immediate and sets it as the 20 MSB of rd
+// 3. Operation AUIPC, takes 20 bit immediate shift it to form a 32 bit value, filling the lowest
+//    12 bits with 0s. Then adds the 32 bit value to PC and sets the output as rd
+// 4. JAL, JALR instructions mutate both the PC and rd.
+//      - JAL has 20 bit immediate whereas other PC update ops, including JALR, have 12 bit
+//      immediates. All immediates are sign extended.
+//      - Both JAL, JALR set rd to pc+4 and set PC to jump target
+//      - jump target = sign_extend(imm)+pc. For JALR, LSB of jump target is set of 0
+// 5. Condition branch instructions BNE, BEQ, BLT[U], BGE[U] don't update rd
 
 /// Input order: a0,a1,..an,s0,s1...,sk
 fn shift_circuit_input_order(
@@ -229,40 +242,47 @@ fn shift_circuit(
     (a, variables)
 }
 
-fn xor_circuit() -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::BddVariableSet)
-{
-    let vars = BddVariableSet::new(&["a", "b"]);
-    let mut a = vars.mk_var_by_name("a");
-    let mut b = vars.mk_var_by_name("b");
-
-    let c: Bdd = a.xor(&b);
-
-    (c, vars)
+enum BIT_OP {
+    AND,
+    OR,
+    XOR,
 }
 
-fn or_circuit() -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::BddVariableSet) {
-    let vars = BddVariableSet::new(&["a", "b"]);
-    let mut a = vars.mk_var_by_name("a");
-    let mut b = vars.mk_var_by_name("b");
+fn bitwise_circuit(
+    bits: usize,
+    bit_op: BIT_OP,
+) -> (
+    Vec<biodivine_lib_bdd::Bdd>,
+    biodivine_lib_bdd::BddVariableSet,
+) {
+    // variables are in the following order: a0,b0,a1,b1,....
+    let variables = BddVariableSet::new_anonymous((bits * 2) as u16);
+    let vars = variables.variables();
+    let mut out = vec![];
+    for i in 0..bits {
+        let a = variables.mk_var(vars[2 * i]);
+        let b = variables.mk_var(vars[2 * i + 1]);
+        let o = match bit_op {
+            BIT_OP::AND => a.and(&b),
+            BIT_OP::XOR => a.xor(&b),
+            BIT_OP::OR => a.or(&b),
+        };
+        out.push(o);
+    }
 
-    let c: Bdd = a.or(&b);
-
-    (c, vars)
+    (out, variables)
 }
 
-fn and_circuit() -> (biodivine_lib_bdd::Bdd, biodivine_lib_bdd::BddVariableSet)
-{
-    let vars = BddVariableSet::new(&["a", "b"]);
-    let mut a = vars.mk_var_by_name("a");
-    let mut b = vars.mk_var_by_name("b");
-
-    let c: Bdd = a.and(&b);
-
-    (c, vars)
-}
-
-fn bitwise_ops_input_order() -> Vec<String> {
-    vec![format!("a"), format!("b")]
+fn bitwise_circuit_input_order(bits: usize) -> Vec<String> {
+    let mut out = vec![];
+    // desired input order: a0,a1,...,an-1, b0, b1,..., bn-1
+    for i in (0..bits * 2).filter(|v| v & 1 != 1) {
+        out.push(format!("x_{}", i));
+    }
+    for i in (0..bits * 2).filter(|v| v & 1 == 1) {
+        out.push(format!("x_{}", i));
+    }
+    out
 }
 
 /// s0 | IL(rs1,rs2) | s1 | s2 | s3 | s4 | imm[0] | pc[0] | s5 | IL(imm[1:20], pc[1:20]) |
@@ -280,7 +300,7 @@ fn pc_update(// bits: usize,
     biodivine_lib_bdd::BddVariableSet,
 ) {
     let bits = 32;
-    let vars_arr: Vec<String> = vec!["s0".to_string()]
+    let vars_arr: Vec<String> = vec!["s2".to_string()]
         .into_iter()
         .chain(
             (0..bits)
@@ -288,17 +308,17 @@ fn pc_update(// bits: usize,
                 .flat_map(|i| [format!("rs1{}", i), format!("rs2{}", i)])
                 .chain(
                     vec![
-                        "s1".to_string(),
-                        "s2".to_string(),
                         "s3".to_string(),
-                        "s4".to_string(),
-                        "imm0".to_string(),
-                        "pc0".to_string(),
-                        "s5".to_string(),
+                        "s2_c".to_string(),
+                        "s1".to_string(),
+                        "s0".to_string(),
+                        "s2_2c".to_string(),
+                        "s1_c".to_string(),
+                        "s0_c".to_string(),
                     ]
                     .into_iter()
                     .chain(
-                        (1..20)
+                        (0..20)
                             .flat_map(|i| {
                                 [format!("imm{}", i), format!("pc{}", i)]
                             })
@@ -314,8 +334,10 @@ fn pc_update(// bits: usize,
     let s1 = vars.mk_var_by_name("s1"); // == | (<u | <s)
     let s2 = vars.mk_var_by_name("s2"); // ==true if ne ops, otherwse false
     let s3 = vars.mk_var_by_name("s3"); // ==true if JALR | JAL, otherwise false
-    let s4 = vars.mk_var_by_name("s4"); // ==true if B op, otherwise false
-    let s5 = vars.mk_var_by_name("s5"); // ==true if JAL, otherwise false
+    let s0_c = vars.mk_var_by_name("s0_c");
+    let s1_c = vars.mk_var_by_name("s1_c");
+    let s2_c = vars.mk_var_by_name("s2_c");
+    let s2_2c = vars.mk_var_by_name("s2_2c");
 
     let mut rs1 = vec![];
     let mut rs2 = vec![];
@@ -334,12 +356,12 @@ fn pc_update(// bits: usize,
     });
 
     let mut comp =
-        Bdd::if_then_else(&s0, &rs2[bits - 1].not(), &rs2[bits - 1]).and(
-            &Bdd::if_then_else(&s0, &rs1[bits - 1], &rs1[bits - 1].not()),
+        Bdd::if_then_else(&s2, &rs2[bits - 1].not(), &rs2[bits - 1]).and(
+            &Bdd::if_then_else(&s2, &rs1[bits - 1], &rs1[bits - 1].not()),
         );
     let mut not_casc =
-        (Bdd::if_then_else(&s0, &rs2[bits - 1].not(), &rs2[bits - 1]).xor(
-            &Bdd::if_then_else(&s0, &rs1[bits - 1].not(), &rs1[bits - 1]),
+        (Bdd::if_then_else(&s2, &rs2[bits - 1].not(), &rs2[bits - 1]).xor(
+            &Bdd::if_then_else(&s2, &rs1[bits - 1].not(), &rs1[bits - 1]),
         ))
         .not();
 
@@ -348,35 +370,43 @@ fn pc_update(// bits: usize,
         not_casc = not_casc.and(&(rs2[i].xor(&rs1[i])).not());
     }
 
-    let mut is_none = Bdd::if_then_else(&s1, &not_casc, &comp);
-    is_none = Bdd::if_then_else(&s2, &is_none.not(), &is_none);
-    is_none = Bdd::if_then_else(&s4, &is_none, &s3);
+    // if not_casc == 1, then rs1==rs2, else rs1!=rs2
+    // if comp == 1, then rs1<rs2, else rs1>=rs2
 
-    // if is_not_none == 1 then pc[0:19] + imm[0:19] else pc + 4
+    let choose_lt_ge = Bdd::if_then_else(&s3, &comp.not(), &comp);
+    let choose_ne_eq = Bdd::if_then_else(&s2_c, &not_casc.not(), &not_casc);
+    let left_root = Bdd::if_then_else(&s1, &choose_lt_ge, &choose_ne_eq);
+    // right_root = s1
+    let is_op = Bdd::if_then_else(&s0, &s1, &left_root);
 
     // 0th bit
     let mut out = vec![];
-    let rhs = Bdd::if_then_else(&is_none, &imm[0], &vars.mk_false());
+    let rhs = Bdd::if_then_else(&is_op, &imm[0], &vars.mk_false());
     let mut c = pc[0].and(&rhs);
-    out.push(Bdd::if_then_else(&s5, &vars.mk_false(), &pc[0].xor(&rhs)));
+    let is_jalr = s0_c.and(&s1_c.and(&s2_2c));
+    out.push(Bdd::if_then_else(
+        &is_jalr,
+        &vars.mk_false(),
+        &pc[0].xor(&rhs),
+    ));
 
     // 1st bit
-    let rhs = Bdd::if_then_else(&is_none, &imm[1], &vars.mk_false());
+    let rhs = Bdd::if_then_else(&is_op, &imm[1], &vars.mk_false());
     out.push((pc[1].xor(&rhs)).xor(&c));
     c = (pc[1].and(&rhs)).or(&(pc[1].xor(&rhs)).and(&c));
 
     // 2nd bit
-    let rhs = Bdd::if_then_else(&is_none, &imm[2], &vars.mk_true());
+    let rhs = Bdd::if_then_else(&is_op, &imm[2], &vars.mk_true());
     out.push((pc[2].xor(&rhs)).xor(&c));
     c = (pc[2].and(&rhs)).or(&(pc[2].xor(&rhs)).and(&c));
 
     // [3:19] bit
     for i in 3..20 {
-        let rhs = Bdd::if_then_else(&is_none, &imm[i], &vars.mk_false());
+        let rhs = Bdd::if_then_else(&is_op, &imm[i], &vars.mk_false());
         out.push((pc[i].xor(&rhs)).xor(&c));
         c = (pc[i].and(&rhs)).or(&(pc[i].xor(&rhs)).and(&c));
     }
-    let imm_sign = Bdd::if_then_else(&is_none, &imm[19], &vars.mk_false());
+    let imm_sign = Bdd::if_then_else(&is_op, &imm[19], &vars.mk_false());
     for i in 20..32 {
         out.push((pc[i].xor(&imm_sign)).xor(&c));
         c = (pc[i].and(&imm_sign)).or(&(pc[i].xor(&imm_sign)).and(&c));
@@ -385,15 +415,13 @@ fn pc_update(// bits: usize,
     (out, vars)
 }
 
-fn pc_update_input_order() -> Vec<String> {
+fn pc_update_input_order() -> (Vec<String>, HashMap<String, String>) {
     let bits = 32;
     let mut out = vec![
         "s0".to_string(),
         "s1".to_string(),
         "s2".to_string(),
         "s3".to_string(),
-        "s4".to_string(),
-        "s5".to_string(),
     ];
     (0..bits).for_each(|i| {
         out.push(format!("rs1{}", i));
@@ -408,7 +436,13 @@ fn pc_update_input_order() -> Vec<String> {
         out.push(format!("imm{}", i));
     });
 
-    out
+    let mut alias_map = HashMap::new();
+    alias_map.insert("s2_c".to_string(), "s2".to_string());
+    alias_map.insert("s2_2c".to_string(), "s2".to_string());
+    alias_map.insert("s0_c".to_string(), "s0".to_string());
+    alias_map.insert("s1_c".to_string(), "s1".to_string());
+
+    (out, alias_map)
 }
 
 /// s==true if signed otherwise s==false
@@ -651,6 +685,7 @@ fn updown_bdd_from_bdd(
     bdd: &Bdd,
     vars: &BddVariableSet,
     input_order: &[String],
+    alias_map: Option<&HashMap<String, String>>,
 ) -> UpDownBDD {
     let var_names = vars.variable_names();
     if var_names.len() != (bdd.num_vars() as usize) {
@@ -799,10 +834,16 @@ fn updown_bdd_from_bdd(
                 ));
             } else {
                 let node_weight = graph.node_weight(*n).unwrap().to_string();
-                let input_index =
-                    input_order.iter().position(|t| &node_weight == t).unwrap();
+                let dealiased_tag = alias_map
+                    .as_ref()
+                    .and_then(|m| m.get(&node_weight).cloned())
+                    .unwrap_or(node_weight);
+                let input_index = input_order
+                    .iter()
+                    .position(|t| &dealiased_tag == t)
+                    .unwrap();
                 curr_lvl.push(Node::new(
-                    node_weight,
+                    dealiased_tag,
                     *n,
                     *pos,
                     *pos,
@@ -812,7 +853,6 @@ fn updown_bdd_from_bdd(
             }
         });
         sorted_nodes.iter().for_each(|(node_i, output_pos)| {
-            let node_weight = graph.node_weight(*node_i).unwrap().to_string();
             let high_index = node_pos_all_lvls
                 .get(
                     &graph
@@ -833,11 +873,18 @@ fn updown_bdd_from_bdd(
                 .unwrap();
             // Find the index of the node in the input array fed for evaluation using
             // the tag assigned to the node by BDD ( i.e. variable name )
-            let input_index =
-                input_order.iter().position(|t| &node_weight == t).unwrap();
+            let node_weight = graph.node_weight(*node_i).unwrap().to_string();
+            let dealiased_tag = alias_map
+                .as_ref()
+                .and_then(|m| m.get(&node_weight).cloned())
+                .unwrap_or(node_weight);
+            let input_index = input_order
+                .iter()
+                .position(|t| &dealiased_tag == t)
+                .unwrap();
 
             curr_lvl.push(Node::new(
-                node_weight,
+                dealiased_tag,
                 *node_i,
                 *output_pos,
                 *high_index,
@@ -1085,7 +1132,6 @@ impl Display for Node {
     }
 }
 
-
 fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
     let udbdds = udbdds.iter().map(|b| b.to_codegen()).collect_vec();
 
@@ -1096,7 +1142,8 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
             let n = ubdd.nodes.len();
             let k = ubdd.lvl_bounds.len();
             (
-                parse_str(&format!("B{bit_index}(BitCircuit<{n}, {k}>)")).unwrap(),
+                parse_str(&format!("B{bit_index}(BitCircuit<{n}, {k}>)"))
+                    .unwrap(),
                 parse_str(&format!("B{bit_index}")).unwrap(),
             )
         })
@@ -1168,12 +1215,6 @@ fn codegen_multibit_output(udbdds: &[UpDownBDD], out_file: &str) {
 #[cfg(test)]
 mod tests {
 
-    use std::{
-        io::Read,
-        iter::zip,
-        ops::{BitAnd, BitOr, BitXor},
-    };
-
     use itertools::Itertools;
     use rand::{Rng, RngCore, rng};
 
@@ -1184,18 +1225,23 @@ mod tests {
     fn input_bits_to_bdd_var_input(
         input_order: &[String],
         bdd_input_order: &[String],
+        bdd_input_alias: Option<&HashMap<String, String>>,
         input_bits: &[u8],
     ) -> Vec<bool> {
-        assert!(input_order.len() == bdd_input_order.len());
+        // assert!(input_order.len() == bdd_input_order.len());
         assert!(input_order.len() == input_bits.len());
 
-        let mut bdd_input = vec![false; input_order.len()];
+        let mut bdd_input = vec![false; bdd_input_order.len()];
         bdd_input_order
             .iter()
             .enumerate()
             .for_each(|(bdd_idx, bdd_var)| {
+                let dealias = bdd_input_alias
+                    .as_deref()
+                    .and_then(|m| m.get(bdd_var).cloned())
+                    .unwrap_or(bdd_var.clone());
                 let pos =
-                    input_order.iter().position(|var| var == bdd_var).unwrap();
+                    input_order.iter().position(|var| var == &dealias).unwrap();
                 assert!(input_bits[pos] <= 1);
                 bdd_input[bdd_idx] = input_bits[pos] == 1;
             });
@@ -1232,12 +1278,6 @@ mod tests {
 
     struct PCU {
         op_type: PCU_T,
-        s0: u8,
-        s1: u8,
-        s2: u8,
-        s3: u8,
-        s4: u8,
-        s5: u8,
         // registers
         rs1: u32,
         rs2: u32,
@@ -1248,38 +1288,23 @@ mod tests {
     }
 
     impl PCU {
-        const NONE: PCU = PCU::new(PCU_T::NONE, 0, 0, 0, 0, 0, 0);
+        const NONE: PCU = PCU::new(PCU_T::NONE);
 
-        const BEQ: PCU = PCU::new(PCU_T::BEQ, 0, 1, 0, 0, 1, 0);
-        const BNE: PCU = PCU::new(PCU_T::BNE, 0, 1, 1, 0, 1, 0);
+        const BEQ: PCU = PCU::new(PCU_T::BEQ);
+        const BNE: PCU = PCU::new(PCU_T::BNE);
 
-        const BLT: PCU = PCU::new(PCU_T::BLT, 1, 0, 0, 0, 1, 0);
-        const BGE: PCU = PCU::new(PCU_T::BGE, 1, 0, 1, 0, 1, 0);
+        const BLT: PCU = PCU::new(PCU_T::BLT);
+        const BGE: PCU = PCU::new(PCU_T::BGE);
 
-        const BLTU: PCU = PCU::new(PCU_T::BLTU, 0, 0, 0, 0, 1, 0);
-        const BGEU: PCU = PCU::new(PCU_T::BGEU, 0, 0, 1, 0, 1, 0);
+        const BLTU: PCU = PCU::new(PCU_T::BLTU);
+        const BGEU: PCU = PCU::new(PCU_T::BGEU);
 
-        const JAL: PCU = PCU::new(PCU_T::JAL, 0, 0, 0, 1, 0, 0);
-        const JALR: PCU = PCU::new(PCU_T::JALR, 0, 0, 0, 1, 0, 1);
-        // const JAL: PCU = PCU::new(0, 0, 0, 1, 0, 1);
+        const JAL: PCU = PCU::new(PCU_T::JAL);
+        const JALR: PCU = PCU::new(PCU_T::JALR);
 
-        const fn new(
-            op_type: PCU_T,
-            s0: u8,
-            s1: u8,
-            s2: u8,
-            s3: u8,
-            s4: u8,
-            s5: u8,
-        ) -> Self {
+        const fn new(op_type: PCU_T) -> Self {
             Self {
                 op_type,
-                s0,
-                s1,
-                s2,
-                s3,
-                s4,
-                s5,
                 rs1: 0,
                 rs2: 0,
                 pc: 0,
@@ -1348,13 +1373,37 @@ mod tests {
         }
 
         fn bdd_encoded_input(&self) -> Vec<u8> {
+            // NOOP :   1000
+            //
+            // JAL  :   1100
+            // JALR :   1110
+            //
+            // BNE  :   0010
+            // BEQ  :   0000
+            //
+            // BLT  :   0110
+            // BGE  :   0111
+            //
+            // BLTU :   0100
+            // BGEU :   0101
+
+            let (s0, s1, s2, s3) = match self.op_type {
+                PCU_T::NONE => (1, 0, 0, 0),
+                PCU_T::JAL => (1, 1, 0, 0),
+                PCU_T::JALR => (1, 1, 1, 0),
+                PCU_T::BNE => (0, 0, 1, 0),
+                PCU_T::BEQ => (0, 0, 0, 0),
+                PCU_T::BLT => (0, 1, 1, 0),
+                PCU_T::BGE => (0, 1, 1, 1),
+                PCU_T::BLTU => (0, 1, 0, 0),
+                PCU_T::BGEU => (0, 1, 0, 1),
+            };
+
             let mut input = vec![];
-            input.push(self.s0);
-            input.push(self.s1);
-            input.push(self.s2);
-            input.push(self.s3);
-            input.push(self.s4);
-            input.push(self.s5);
+            input.push(s0);
+            input.push(s1);
+            input.push(s2);
+            input.push(s3);
 
             input.extend(u32_to_bits(self.rs1).iter());
             input.extend(u32_to_bits(self.rs2).iter());
@@ -1433,29 +1482,35 @@ mod tests {
     fn test_pc_update() {
         let (bdd, vars) = pc_update();
         let bdd_input_order = vars.variable_names();
-        let input_order = pc_update_input_order();
+        let (input_order, input_alias_map) = pc_update_input_order();
         let udbdds = bdd
             .iter()
-            .map(|b| updown_bdd_from_bdd(b, &vars, &input_order))
+            .map(|b| {
+                updown_bdd_from_bdd(
+                    b,
+                    &vars,
+                    &input_order,
+                    Some(&input_alias_map),
+                )
+            })
             .collect_vec();
-        // println!("{}", bdd[31].to_dot_string(&vars, false));
+        println!("{}", bdd[31].to_dot_string(&vars, false));
 
         // let udbdd = updown_bdd_from_bdd(&bdd[31], &vars, &input_order);
-        // println!("Stats: {}", udbdd.stats());
-        // println!("BDD input order: {:?}", &bdd_input_order);
+        println!("Stats: {}", udbdds[31].stats()); // println!("BDD input order: {:?}", &bdd_input_order);
         // println!("Input order: {:?}", &input_order);
 
-        for _ in 0..20 {
+        for _ in 0..1 {
             [
-                 PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).set_rs2_equal_rs1(),
-                 PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
+                 PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs2_equal_rs1(),
+                 PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
 
-                 PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
-                 PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).set_rs2_equal_rs1(),
+                 PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
+                 PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs2_equal_rs1(),
 
                  PCU::BLTU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
                  PCU::BLTU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2(),
-
+                 
                  PCU::BGEU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2(),
                  PCU::BGEU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
 
@@ -1465,13 +1520,15 @@ mod tests {
                  PCU::BGE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2_signed(),
                  PCU::BGE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2_signed(),
 
-                 PCU::JAL.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()), 
-                 PCU::JALR.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()), 
+                 PCU::JAL.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
+                 PCU::JALR.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
+
+                PCU::NONE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
              ].iter_mut().for_each(|pcu| {
                     let input_bitstring = pcu.bdd_encoded_input();
 
                     let bdd_input =
-                        input_bits_to_bdd_var_input(&input_order, &bdd_input_order, &input_bitstring);
+                        input_bits_to_bdd_var_input(&input_order, &bdd_input_order, Some(&input_alias_map),&input_bitstring);
                     let bdd_out: Vec<u8> = bdd
                         .iter()
                         .map(|bdd| bdd.eval_in(&BddValuation::new(bdd_input.clone())) as u8)
@@ -1483,7 +1540,7 @@ mod tests {
                     let have_ggsw =bits_to_u32(&output_ggsw);
                     let have_bdd= bits_to_u32(&bdd_out);
                     let want = pcu.expected_update();
-                    
+
                     if have_bdd != have_ggsw {
                         println!("Udbdd output {have_ggsw} != bdd output {have_bdd}");
                     }
@@ -1512,7 +1569,7 @@ mod tests {
         // println!("{}", udbdd);
         let add_udbdds = add_bdds
             .iter()
-            .map(|b| updown_bdd_from_bdd(b, &add_vars, &add_input_order))
+            .map(|b| updown_bdd_from_bdd(b, &add_vars, &add_input_order, None))
             .collect_vec();
 
         let (sub_bdds, sub_vars) = sub(bits);
@@ -1520,7 +1577,7 @@ mod tests {
         let sub_input_order = adder_input_order(bits);
         let sub_udbdds = sub_bdds
             .iter()
-            .map(|b| updown_bdd_from_bdd(b, &sub_vars, &sub_input_order))
+            .map(|b| updown_bdd_from_bdd(b, &sub_vars, &sub_input_order, None))
             .collect_vec();
 
         println!(
@@ -1587,18 +1644,26 @@ mod tests {
             &unsigned_bdd,
             &unsigned_vars,
             &unsigned_comparitor_input_order(bits),
+            None,
         );
         let signed_udbdd = updown_bdd_from_bdd(
             &signed_bdd,
             &signed_vars,
             &unsigned_comparitor_input_order(bits),
+            None,
         );
 
         println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
         println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
 
-        codegen_multibit_output(&[unsigned_udbdd.clone()], "target/sltu_codegen.rs");
-        codegen_multibit_output(&[signed_udbdd.clone()], "target/slt_codegen.rs");
+        codegen_multibit_output(
+            &[unsigned_udbdd.clone()],
+            "target/sltu_codegen.rs",
+        );
+        codegen_multibit_output(
+            &[signed_udbdd.clone()],
+            "target/slt_codegen.rs",
+        );
 
         let input_order = unsigned_comparitor_input_order(bits);
         let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
@@ -1615,6 +1680,7 @@ mod tests {
             let input_bools: Vec<bool> = input_bits_to_bdd_var_input(
                 &input_order,
                 &bdd_var_order,
+                None,
                 &input_bits,
             );
             let inputs: Vec<GGSW> =
@@ -1650,29 +1716,40 @@ mod tests {
 
     #[test]
     fn test_bitwise_ops() {
-        let (and_bdd, and_vars) = and_circuit();
-        let (or_bdd, or_vars) = or_circuit();
-        let (xor_bdd, xor_vars) = xor_circuit();
+        let bits = 32;
+        let (and_bdd, and_vars) = bitwise_circuit(bits, BIT_OP::AND);
+        let (or_bdd, or_vars) = bitwise_circuit(bits, BIT_OP::OR);
+        let (xor_bdd, xor_vars) = bitwise_circuit(bits, BIT_OP::XOR);
+        let bitwise_input_order = bitwise_circuit_input_order(bits);
 
-        let and_udbdd: UpDownBDD = updown_bdd_from_bdd(
-            &and_bdd,
-            &and_vars,
-            &bitwise_ops_input_order(),
-        );
-        let or_udbdd =
-            updown_bdd_from_bdd(&or_bdd, &or_vars, &bitwise_ops_input_order());
-        let xor_udbdd = updown_bdd_from_bdd(
-            &xor_bdd,
-            &xor_vars,
-            &bitwise_ops_input_order(),
-        );
-        println!("And UpDownBDD stats: {}", and_udbdd.stats());
-        println!("Or UpDownBDD stats: {}", or_udbdd.stats());
-        println!("Xor UpDownBDD stats: {}", xor_udbdd.stats());
+        println!("Input order: {:?}", &bitwise_input_order);
 
-        codegen_multibit_output(&[and_udbdd.clone()], "target/and_codegen.rs");
-        codegen_multibit_output(&[or_udbdd.clone()], "target/or_codegen.rs");
-        codegen_multibit_output(&[xor_udbdd.clone()], "target/xor_codegen.rs");
+        let and_udbdds = and_bdd
+            .iter()
+            .map(|bdd| {
+                updown_bdd_from_bdd(bdd, &and_vars, &bitwise_input_order, None)
+            })
+            .collect_vec();
+        let or_udbdds = or_bdd
+            .iter()
+            .map(|bdd| {
+                updown_bdd_from_bdd(bdd, &and_vars, &bitwise_input_order, None)
+            })
+            .collect_vec();
+        let xor_udbdds = xor_bdd
+            .iter()
+            .map(|bdd| {
+                updown_bdd_from_bdd(bdd, &and_vars, &bitwise_input_order, None)
+            })
+            .collect_vec();
+
+        println!("And UpDownBDD stats: {}", and_udbdds[bits - 1].stats());
+        println!("Or UpDownBDD stats: {}", or_udbdds[bits - 1].stats());
+        println!("Xor UpDownBDD stats: {}", xor_udbdds[bits - 1].stats());
+
+        codegen_multibit_output(&and_udbdds, "target/and_codegen.rs");
+        codegen_multibit_output(&or_udbdds, "target/or_codegen.rs");
+        codegen_multibit_output(&xor_udbdds, "target/xor_codegen.rs");
         // let input_order = unsigned_comparitor_input_order(bits);
         // let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
         //
@@ -1730,6 +1807,7 @@ mod tests {
                         bdd,
                         &vars,
                         &shift_circuit_input_order(bits, shift_bits),
+                        None,
                     )
                 })
                 .collect();
