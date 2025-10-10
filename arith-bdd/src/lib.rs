@@ -3,7 +3,7 @@ use std::{fmt::Display, iter};
 // use petgraph::dot::dot_parser::
 use biodivine_lib_bdd::*;
 use itertools::Itertools;
-use petgraph::Direction::Outgoing;
+use petgraph::Direction::{Incoming, Outgoing};
 use petgraph::Graph;
 use petgraph::algo::toposort;
 use petgraph::dot::Dot;
@@ -305,7 +305,7 @@ fn pc_update(// bits: usize,
         .chain(
             (0..bits)
                 .rev()
-                .flat_map(|i| [format!("rs1{}", i), format!("rs2{}", i)])
+                .flat_map(|i| [format!("rs1_{}", i), format!("rs2_{}", i)])
                 .chain(
                     vec![
                         "s3".to_string(),
@@ -334,6 +334,7 @@ fn pc_update(// bits: usize,
     let s1 = vars.mk_var_by_name("s1"); // == | (<u | <s)
     let s2 = vars.mk_var_by_name("s2"); // ==true if ne ops, otherwse false
     let s3 = vars.mk_var_by_name("s3"); // ==true if JALR | JAL, otherwise false
+    // aliases, `c` stands for copy
     let s0_c = vars.mk_var_by_name("s0_c");
     let s1_c = vars.mk_var_by_name("s1_c");
     let s2_c = vars.mk_var_by_name("s2_c");
@@ -342,8 +343,8 @@ fn pc_update(// bits: usize,
     let mut rs1 = vec![];
     let mut rs2 = vec![];
     (0..bits).for_each(|i| {
-        rs1.push(vars.mk_var_by_name(&format!("rs1{}", i)));
-        rs2.push(vars.mk_var_by_name(&format!("rs2{}", i)));
+        rs1.push(vars.mk_var_by_name(&format!("rs1_{}", i)));
+        rs2.push(vars.mk_var_by_name(&format!("rs2_{}", i)));
     });
 
     let mut pc = vec![];
@@ -354,6 +355,8 @@ fn pc_update(// bits: usize,
             imm.push(vars.mk_var_by_name(&format!("imm{}", i)));
         }
     });
+
+    // ==== Circuit begins ====
 
     let mut comp =
         Bdd::if_then_else(&s2, &rs2[bits - 1].not(), &rs2[bits - 1]).and(
@@ -424,10 +427,10 @@ fn pc_update_input_order() -> (Vec<String>, HashMap<String, String>) {
         "s3".to_string(),
     ];
     (0..bits).for_each(|i| {
-        out.push(format!("rs1{}", i));
+        out.push(format!("rs1_{}", i));
     });
     (0..bits).for_each(|i| {
-        out.push(format!("rs2{}", i));
+        out.push(format!("rs2_{}", i));
     });
     (0..bits).for_each(|i| {
         out.push(format!("pc{}", i));
@@ -661,7 +664,7 @@ fn add_sub_input_order(bits: usize) -> Vec<String> {
         .collect()
 }
 
-fn levels_for_graph(graph: &Graph<&str, i32>) -> HashMap<NodeIndex, usize> {
+fn levels_for_graph(graph: &Graph<String, i32>) -> HashMap<NodeIndex, usize> {
     let top_sort = toposort(graph, Default::default()).unwrap();
 
     let mut level_map = HashMap::new();
@@ -680,13 +683,77 @@ fn levels_for_graph(graph: &Graph<&str, i32>) -> HashMap<NodeIndex, usize> {
     level_map
 }
 
+fn levelise_graph(
+    graph: &mut Graph<String, i32>,
+    levels: HashMap<NodeIndex, usize>,
+) {
+    let max_level = *levels.values().max().unwrap();
+    for lvl in 0..max_level + 1 {
+        for (node, _) in levels.iter().filter(|(_, l)| **l == lvl) {
+            let node_weight = graph.node_weight(*node).unwrap().clone();
+
+            let mut max_lvl_to_reach = lvl;
+            let mut add_edges = vec![];
+            let mut delete_edges = vec![];
+            for out in graph.edges_directed(*node, Outgoing) {
+                let node2 = out.target();
+                let lvl_child = *levels.get(&node2).unwrap();
+                max_lvl_to_reach = std::cmp::max(max_lvl_to_reach, lvl_child);
+                add_edges.push((node2, lvl_child, *out.weight()));
+                delete_edges.push(out.id());
+            }
+
+            // println!("{}: {}, {}", node_weight, lvl, max_lvl_to_reach);
+
+            // delete old edges
+            for e in delete_edges {
+                graph.remove_edge(e);
+            }
+
+            // add dummy nodes
+            // start node is at level = lvl
+            let mut start = *node;
+            for l in lvl + 1..max_lvl_to_reach + 1 {
+                add_edges.iter().filter(|(_, cl, _)| *cl == l).for_each(
+                    |(n, _, we)| {
+                        graph.add_edge(start, *n, *we);
+                    },
+                );
+
+                if l < max_lvl_to_reach {
+                    let next = graph.add_node(node_weight.clone());
+                    graph.add_edge(start, next, 2); // edge weight 2 implies copy
+                    start = next;
+                }
+            }
+        }
+    }
+}
+
+fn translate_node_tag_to_input_index(
+    node_tag: &String,
+    input_order: &[String],
+    alias_map: Option<&HashMap<String, String>>,
+) -> usize {
+    let dealiased_tag = alias_map
+        .as_ref()
+        .and_then(|m| m.get(node_tag).cloned())
+        .unwrap_or(node_tag.clone());
+    let input_index = input_order
+        .iter()
+        .position(|t| &dealiased_tag == t)
+        .unwrap();
+
+    input_index
+}
+
 // input_order: order of the variables as expected in the input array at evaluation
 fn updown_bdd_from_bdd(
     bdd: &Bdd,
     vars: &BddVariableSet,
     input_order: &[String],
     alias_map: Option<&HashMap<String, String>>,
-) -> UpDownBDD {
+) -> UpDownBDD2 {
     let var_names = vars.variable_names();
     if var_names.len() != (bdd.num_vars() as usize) {
         panic!(
@@ -700,8 +767,8 @@ fn updown_bdd_from_bdd(
     let mut graph = DiGraph::new();
     // Bdd pointer index -> NodeIndex
     let mut bdd_index_to_node_index = HashMap::new();
-    let terminal_node0 = graph.add_node("0");
-    let terminal_node1 = graph.add_node("1");
+    let terminal_node0 = graph.add_node("0".to_string());
+    let terminal_node1 = graph.add_node("1".to_string());
     bdd_index_to_node_index.insert(0, terminal_node0);
     bdd_index_to_node_index.insert(1, terminal_node1);
     // bdd.pointers().take(2).for_each(f);
@@ -712,7 +779,8 @@ fn updown_bdd_from_bdd(
                 .insert(
                     node_pointer.to_index(),
                     graph.add_node(
-                        &var_names[bdd.var_of(node_pointer).to_index()]
+                        var_names[bdd.var_of(node_pointer).to_index()]
+                            .to_string()
                     ),
                 )
                 .is_none()
@@ -736,187 +804,170 @@ fn updown_bdd_from_bdd(
         graph.add_edge(*low_node, *curr_node, 0);
     }
 
-    // let dot = Dot::with_config(&graph, &[]).to_string();
-    // println!("{}", dot);
+    // levelise the inverset BDD graph s.t. edge only exists between nodes that in consecutive
+    // levels. We call the resulting graph: levelised graph
+    {
+        let levels = levels_for_graph(&graph);
+        levelise_graph(&mut graph, levels);
+        // println!("levelised udbdd {}", Dot::with_config(&graph, &[]));
+    }
 
-    // create UpDownBDD instance //
-    let node_index_to_lvl = levels_for_graph(&graph);
-    // println!("Node levels = {:?}", node_index_to_lvl);
+    // ==== process the levelised graph as a state vector machine ====
 
-    let max_level = node_index_to_lvl.values().max().unwrap();
-    let mut node_pos_all_lvls = HashMap::new();
-    let mut outputs_set = HashMap::new();
-    node_pos_all_lvls.insert(terminal_node0, 0);
-    node_pos_all_lvls.insert(terminal_node1, 1);
-    assert!(
-        node_index_to_lvl
+    let levels = levels_for_graph(&graph);
+    let max_level = *levels.values().max().unwrap();
+    let mut levels_to_nodes_map = HashMap::new();
+    let mut max_width = 2;
+    for l in 0..max_level + 1 {
+        let set: HashSet<NodeIndex> = levels
             .iter()
-            .filter(|(_, lvl)| *lvl == max_level)
-            .count()
-            == 1
+            .filter(|(_, nl)| **nl == l)
+            .map(|(n, _)| *n)
+            .collect();
+        max_width = std::cmp::max(max_width, set.len());
+        levels_to_nodes_map.insert(l, set);
+    }
+
+    // {
+    //     println!("Levels maps: ");
+    //     for l in 0..max_level + 1 {
+    //         println!("  {l}: {:?}", levels_to_nodes_map.get(&l).unwrap());
+    //     }
+    // }
+
+    assert_eq!(
+        levels_to_nodes_map.get(&0).unwrap(),
+        &HashSet::from_iter([NodeIndex::new(0), NodeIndex::new(1)].into_iter())
     );
-    let out_node = node_index_to_lvl
-        .iter()
-        .find(|(_, lvl)| *lvl == max_level)
-        .unwrap();
-    outputs_set.insert(*out_node.0, 0);
-    for lvl in (1..max_level + 1).rev() {
-        let mut nodes_at_lvl = node_index_to_lvl
-            .iter()
-            .filter(|(n, v)| **v == lvl)
-            .map(|(node, _)| outputs_set.remove_entry(node).unwrap())
-            .collect_vec();
-        // Sort to assign lower index output position to nodes with greater access depth
-        nodes_at_lvl.sort_by(|a, b| Ord::cmp(&b.1, &a.1));
-        // println!("nodes: {:?}", nodes_at_lvl);
+    let mut nodes_to_outpos = HashMap::new();
+    nodes_to_outpos.insert(NodeIndex::new(0), 0usize);
+    nodes_to_outpos.insert(NodeIndex::new(1), 1usize);
 
-        // offset makes room in the output position for nodes that remain unremoved at this level
-        let offset = outputs_set.len();
-        for (index, (node_i, _)) in nodes_at_lvl.iter().enumerate() {
-            node_pos_all_lvls.insert(*node_i, index + offset);
-        }
+    let mut level_nodes = vec![];
+    // skip the first and the last level
+    for l in 1..max_level {
+        let nodes_at_lvl = levels_to_nodes_map.get(&l).unwrap();
+        let mut pos_set: HashSet<usize> = HashSet::from_iter(0usize..max_width);
 
-        // Increment depth of unremoved output nodes by 1
-        outputs_set.iter_mut().for_each(|(_, depth)| *depth += 1);
+        // Nodes are placed sorted by output position
+        let mut curr_level = vec![Node::None; max_width];
 
-        // refill the output set for lvl - 1
-        for (node_i, _) in node_index_to_lvl.iter().filter(|(n, v)| **v == lvl)
-        {
-            graph
-                .edges_directed(*node_i, petgraph::Direction::Incoming)
-                .filter(|e| *e.weight() == 1 || *e.weight() == 0)
-                .for_each(|er| {
-                    let source_node = er.source();
-                    if !outputs_set.contains_key(&source_node) {
-                        outputs_set.insert(source_node, 0);
-                    }
-                });
-        }
-    }
-    assert!(outputs_set.remove(&terminal_node0).is_some());
-    assert!(outputs_set.remove(&terminal_node1).is_some());
-    assert!(outputs_set.is_empty());
-
-    let mut nodes_lvld = vec![];
-    let mut input_state = vec![(terminal_node0, 0), (terminal_node1, 1)];
-    for lvl in 1..max_level + 1 {
-        let mut curr_lvl = vec![];
-
-        let sorted_nodes = node_index_to_lvl
-            .iter()
-            .filter(|(n, v)| **v == lvl)
-            // map (NodeIndex, lvl) -> (NodeIndex, Output pos)
-            .map(|a| (*a.0, node_pos_all_lvls.get(a.0).unwrap().clone()))
-            .sorted_by(|(_, a_pos), (_, b_pos)| Ord::cmp(a_pos, b_pos))
-            .collect_vec();
-
-        // At any level certain input nodes in input state, when they are required at another
-        // deeper level, are copied to the ouput state at the same position. In such cases, the
-        // output state position of outputs at the current level are offsetted accordingly. Below
-        // we insert the nodes that are copied from the input in the output state, then insert
-        // outputs of the current level in the output state.
-
-        // drop all nodes from input state starting from output pos of the first output node
-        input_state.truncate(sorted_nodes[0].1);
-
-        input_state.iter().for_each(|(n, pos)| {
-            if n == &terminal_node1 || n == &terminal_node0 {
-                // terminal nodes are not actual nodes
-                // use any input index because it's not used when input state is copied over
-
-                curr_lvl.push(Node::new(
-                    "terminal".to_string(),
-                    *n,
-                    *pos,
-                    *pos,
-                    *pos,
-                    0,
-                ));
-            } else {
-                let node_weight = graph.node_weight(*n).unwrap().to_string();
-                let dealiased_tag = alias_map
-                    .as_ref()
-                    .and_then(|m| m.get(&node_weight).cloned())
-                    .unwrap_or(node_weight);
-                let input_index = input_order
-                    .iter()
-                    .position(|t| &dealiased_tag == t)
-                    .unwrap();
-                curr_lvl.push(Node::new(
-                    dealiased_tag,
-                    *n,
-                    *pos,
-                    *pos,
-                    *pos,
-                    input_index,
-                ));
+        // handle copy nodes
+        nodes_at_lvl.iter().filter_map(|n| {
+            let incoming_edges =
+                graph.edges_directed(*n, Incoming).collect_vec();
+            assert!(incoming_edges.len() <= 2);
+            if incoming_edges.len() == 1 {
+                assert!(
+                    incoming_edges[0].weight() == &2,
+                    "Node has one incoming edge but with weight not equal to 2"
+                );
+                return Some((incoming_edges[0].source(), *n));
             }
-        });
-        sorted_nodes.iter().for_each(|(node_i, output_pos)| {
-            let high_index = node_pos_all_lvls
-                .get(
-                    &graph
-                        .edges_directed(*node_i, petgraph::Direction::Incoming)
-                        .find(|e| *e.weight() == 1)
-                        .expect("High index should exist")
-                        .source(),
-                )
-                .unwrap();
-            let low_index = node_pos_all_lvls
-                .get(
-                    &graph
-                        .edges_directed(*node_i, petgraph::Direction::Incoming)
-                        .find(|e| *e.weight() == 0)
-                        .expect("Low index should exist")
-                        .source(),
-                )
-                .unwrap();
-            // Find the index of the node in the input array fed for evaluation using
-            // the tag assigned to the node by BDD ( i.e. variable name )
-            let node_weight = graph.node_weight(*node_i).unwrap().to_string();
-            let dealiased_tag = alias_map
-                .as_ref()
-                .and_then(|m| m.get(&node_weight).cloned())
-                .unwrap_or(node_weight);
-            let input_index = input_order
-                .iter()
-                .position(|t| &dealiased_tag == t)
-                .unwrap();
+            None
+        }).for_each(|(parent_node, copy_node)| {
+                let parent_pos = *nodes_to_outpos.get(&parent_node).unwrap();
+                // println!("Copy node:{:?}, Parent node:{:?}, Parent Pos:{}, Parent lvl:{}", copy_node, parent_node, parent_pos, levels.get(&parent_node).unwrap());
+                assert!(pos_set.remove(&parent_pos)==true, "Copy node pos is inuse but some other copy node");
 
-            curr_lvl.push(Node::new(
-                dealiased_tag,
-                *node_i,
-                *output_pos,
-                *high_index,
-                *low_index,
-                input_index,
-            ));
-        });
+                let node_weight = graph.node_weight(copy_node).unwrap().clone();
+                curr_level[parent_pos]=Node::Copy(CopyNode::new(node_weight, parent_node, copy_node, parent_pos ));
 
-        nodes_lvld.push(curr_lvl);
+                nodes_to_outpos.insert(copy_node, parent_pos);
+            });
 
-        // insert output nodes of current level to input state of the next
-        sorted_nodes.iter().for_each(|v| {
-            // sanity check
-            assert_eq!(input_state.len(), v.1);
-            input_state.push(*v);
-        });
+        // handle rest of the nodes
+        nodes_at_lvl
+            .iter()
+            .filter_map(|n| {
+                let mut incoming_edges =
+                    graph.edges_directed(*n, Incoming).collect_vec();
+                if incoming_edges.len() == 2 {
+                    // sort edges: low_index, high_index
+                    incoming_edges.sort_by(|a, b| a.weight().cmp(b.weight()));
+                    assert!(
+                        incoming_edges[0].weight() == &0
+                            && incoming_edges[1].weight() == &1
+                    );
+                    // (low_node, high_node, curr_node)
+                    return Some((
+                        incoming_edges[0].source(),
+                        incoming_edges[1].source(),
+                        *n,
+                    ));
+                }
+                None
+            })
+            .for_each(|(low_node, high_node, curr_node)| {
+                let curr_pos = pos_set.iter().next().cloned().expect("Positions ran out before each node at level has a position");
+                assert!(pos_set.remove(&curr_pos));
+
+                let high_index =*nodes_to_outpos.get(&high_node).unwrap();
+                let low_index =* nodes_to_outpos.get(&low_node).unwrap();
+                let node_weight = graph.node_weight(curr_node).unwrap().clone();
+                let input_index = translate_node_tag_to_input_index(&node_weight, input_order, alias_map);
+                curr_level[curr_pos] = Node::OpNode(OpNode::new(node_weight, curr_node,high_node ,low_node, curr_pos, high_index, low_index, input_index));
+
+                nodes_to_outpos.insert(curr_node, curr_pos);
+            });
+
+        // println!("Lvl {}: {:?}", l, curr_level);
+        level_nodes.push(curr_level);
     }
 
-    assert_eq!(input_state.len(), 1);
+    // process last level
+    //
+    // force output node output pos as 0
+    {
+        let output_node = levels_to_nodes_map.get(&max_level).unwrap();
+        assert_eq!(output_node.len(), 1);
+        let output_node = output_node.iter().last().unwrap().clone();
 
-    return UpDownBDD::new(nodes_lvld);
+        let mut incoming_edges =
+            graph.edges_directed(output_node, Incoming).collect_vec();
+        incoming_edges.sort_by(|a, b| a.weight().cmp(b.weight()));
+        assert!(
+            incoming_edges[0].weight() == &0
+                && incoming_edges[1].weight() == &1
+        );
+        let high_node = incoming_edges[1].source();
+        let low_node = incoming_edges[0].source();
+
+        let high_index = *nodes_to_outpos.get(&high_node).unwrap();
+        let low_index = *nodes_to_outpos.get(&low_node).unwrap();
+        let node_weight = graph.node_weight(output_node).unwrap().clone();
+        let input_index = translate_node_tag_to_input_index(
+            &node_weight,
+            input_order,
+            alias_map,
+        );
+        let mut tmp_vec = vec![Node::None; max_width];
+        tmp_vec[0] = Node::OpNode(OpNode::new(
+            node_weight,
+            output_node,
+            high_node,
+            low_node,
+            0,
+            high_index,
+            low_index,
+            input_index,
+        ));
+        level_nodes.push(tmp_vec);
+
+        nodes_to_outpos.insert(output_node, 0);
+    }
+    UpDownBDD2::new(level_nodes)
 }
 
 struct CodegenUpDownBDD {
-    nodes: Vec<Node>,
+    nodes: Vec<OpNode>,
     lvl_bounds: Vec<usize>,
     max_inter_state: usize,
 }
 
 impl CodegenUpDownBDD {
     fn new(
-        nodes: Vec<Node>,
+        nodes: Vec<OpNode>,
         lvl_bounds: Vec<usize>,
         max_inter_state: usize,
     ) -> Self {
@@ -929,16 +980,41 @@ impl CodegenUpDownBDD {
 }
 
 #[derive(Clone)]
-struct UpDownBDD {
-    nodes_levelled: Vec<Vec<Node>>,
+struct UpDownBDD2 {
+    level_nodes: Vec<Vec<Node>>,
 }
 
+impl UpDownBDD2 {
+    fn new(level_nodes: Vec<Vec<Node>>) -> UpDownBDD2 {
+        UpDownBDD2 { level_nodes }
+    }
+}
+
+#[derive(Clone)]
+struct UpDownBDD {
+    nodes_levelled: Vec<Vec<OpNode>>,
+}
+
+impl Display for UpDownBDD2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "### UpDownBDD ###")?;
+        for (index, nodes) in self.level_nodes.iter().enumerate() {
+            write!(f, "Level {}: ", index)?;
+            for n in nodes {
+                write!(f, " {:?} ", n)?;
+            }
+            writeln!(f, "")?;
+        }
+
+        Ok(())
+    }
+}
 impl UpDownBDD {
-    fn new(nodes_levelled: Vec<Vec<Node>>) -> Self {
+    fn new(nodes_levelled: Vec<Vec<OpNode>>) -> Self {
         Self { nodes_levelled }
     }
 
-    fn nodes_levelled(&self) -> &[Vec<Node>] {
+    fn nodes_levelled(&self) -> &[Vec<OpNode>] {
         &self.nodes_levelled
     }
 
@@ -1007,13 +1083,13 @@ impl UpDownBDD {
 
 impl Display for UpDownBDD {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "### UpDownBDD ###");
+        writeln!(f, "### UpDownBDD ###")?;
         for (index, nodes) in self.nodes_levelled().iter().enumerate() {
             write!(f, "Level {}: ", index)?;
             for n in nodes {
                 write!(f, " {} ", n)?;
             }
-            writeln!(f, "");
+            writeln!(f, "")?;
         }
 
         Ok(())
@@ -1061,47 +1137,83 @@ fn cmux(selector: &GGSW, if_true: &GLWECt, if_false: &GLWECt) -> GLWECt {
     }
 }
 
-fn execute(bdd: &UpDownBDD, inputs: &[GGSW]) -> GLWECt {
-    let mut out = vec![GLWECt::default(); bdd.to_codegen().max_inter_state];
+fn execute(bdd: &UpDownBDD2, inputs: &[GGSW]) -> GLWECt {
+    let mut out = vec![GLWECt::default(); bdd.level_nodes[0].len()];
 
     out[0] = GLWECt::new(0);
     out[1] = GLWECt::new(1);
 
-    for (lvl_i, lvl_nodes) in bdd.nodes_levelled().iter().enumerate() {
+    for (lvl_i, lvl_nodes) in bdd.level_nodes.iter().enumerate() {
         let out_old = out.clone();
         for (out_pos, node) in lvl_nodes.iter().enumerate() {
-            assert!(out_pos == node.output_pos);
-            // println!("Node={:?} level={}", node, lvl_i);
-            let o = if node.high_index == node.low_index {
-                out_old[out_pos].clone()
-            } else {
-                cmux(
+            let out_ct = match node {
+                Node::OpNode(node) => cmux(
                     &inputs[node.input_index],
                     &out_old[node.high_index],
                     &out_old[node.low_index],
-                )
+                ),
+                Node::Copy(node) => out_old[out_pos].clone(),
+                Node::None => GLWECt::default(),
             };
-            out[out_pos] = o;
+            out[out_pos] = out_ct;
         }
     }
     out[0].clone()
 }
 
 #[derive(Debug, Clone)]
-struct Node {
+struct CopyNode {
+    tag: String,
+    parent_node: NodeIndex<u32>,
+    node_index: NodeIndex<u32>,
+    // output_pos == input_pos
+    output_pos: usize,
+}
+
+impl CopyNode {
+    fn new(
+        tag: String,
+        parent_node: NodeIndex<u32>,
+        node_index: NodeIndex<u32>,
+        output_pos: usize,
+    ) -> Self {
+        Self {
+            tag,
+            parent_node,
+            node_index,
+            output_pos,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Node {
+    Copy(CopyNode),
+    OpNode(OpNode),
+    None,
+}
+
+#[derive(Debug, Clone)]
+struct OpNode {
     tag: String,
     // Store NodeIndex for debugging purposes
     node_index: NodeIndex<u32>,
+    // Debugging purpoess
+    high_node: NodeIndex<u32>,
+    // Debugging purposes
+    low_node: NodeIndex<u32>,
     output_pos: usize,
     high_index: usize,
     low_index: usize,
     input_index: usize,
 }
 
-impl Node {
+impl OpNode {
     fn new(
         tag: String,
         node_index: NodeIndex<u32>,
+        high_node: NodeIndex<u32>,
+        low_node: NodeIndex<u32>,
         output_pos: usize,
         high_index: usize,
         low_index: usize,
@@ -1110,6 +1222,8 @@ impl Node {
         Self {
             tag,
             node_index,
+            high_node,
+            low_node,
             high_index,
             output_pos,
             low_index,
@@ -1118,13 +1232,15 @@ impl Node {
     }
 }
 
-impl Display for Node {
+impl Display for OpNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Node {{ tag: {}, node_index: {:?}, output_pos: {}, high_index: {}, low_index: {} }}",
+            "Node {{ tag: {}, node_index: {:?}, high_node: {:?}, low_node: {:?}, output_pos: {}, high_index: {}, low_index: {} }}",
             self.tag,
             self.node_index,
+            self.high_node,
+            self.low_node,
             self.output_pos,
             self.high_index,
             self.low_index
@@ -1479,6 +1595,48 @@ mod tests {
     }
 
     #[test]
+    fn trial() {
+        let bits = 32;
+        let (bdd, vars) = add(bits);
+        let bdd_input_order = vars.variable_names();
+        let (input_order) = adder_input_order(bits);
+        let udbdds = bdd
+            .iter()
+            .map(|b| updown_bdd_from_bdd(b, &vars, &input_order, None))
+            .collect_vec();
+
+        let a = 22131;
+        let b = 21412;
+
+        let input_bitstring = u32_to_bits(a)
+            .into_iter()
+            .take(bits)
+            .chain(u32_to_bits(b).into_iter().take(bits))
+            .collect_vec();
+        let input_ggsw =
+            input_bitstring.iter().map(|b| GGSW::from(*b)).collect_vec();
+
+        let out = udbdds
+            .iter()
+            .map(|ubd| execute(ubd, &input_ggsw).value as u8)
+            .collect_vec();
+
+        let have = bits_to_u32(&out);
+
+        assert_eq!(have, a + b);
+
+        // let mut levelised_graph = graph.clone();
+        // let levels = levels_for_graph(&levelised_graph);
+        // levelise_graph(&mut levelised_graph, levels);
+        //
+        // println!("Graph: {:?}", Dot::with_config(&graph, &[]));
+        // println!(
+        //     "Levelised Graph: {:?}",
+        //     Dot::with_config(&levelised_graph, &[])
+        // );
+    }
+
+    #[test]
     fn test_pc_update() {
         let (bdd, vars) = pc_update();
         let bdd_input_order = vars.variable_names();
@@ -1494,36 +1652,32 @@ mod tests {
                 )
             })
             .collect_vec();
-        println!("{}", bdd[31].to_dot_string(&vars, false));
 
-        // let udbdd = updown_bdd_from_bdd(&bdd[31], &vars, &input_order);
-        println!("Stats: {}", udbdds[31].stats()); // println!("BDD input order: {:?}", &bdd_input_order);
-        // println!("Input order: {:?}", &input_order);
-
-        for _ in 0..1 {
+        for _ in 0..1000 {
             [
-                 PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs2_equal_rs1(),
-                 PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
+                PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs2_equal_rs1(),
+                PCU::BEQ.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
 
-                 PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
-                 PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs2_equal_rs1(),
+                PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
+                PCU::BNE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs2_equal_rs1(),
 
-                 PCU::BLTU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
-                 PCU::BLTU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2(),
-                 
-                 PCU::BGEU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2(),
-                 PCU::BGEU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
+                PCU::BLTU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
+                PCU::BLTU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2(),
 
-                 PCU::BLT.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2_signed(),
-                 PCU::BLT.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2_signed(),
+                PCU::BGEU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2(),
+                PCU::BGEU.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2(),
 
-                 PCU::BGE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2_signed(),
-                 PCU::BGE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2_signed(),
+                PCU::BLT.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2_signed(),
+                PCU::BLT.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2_signed(),
 
-                 PCU::JAL.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
-                 PCU::JALR.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
+                PCU::BGE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_gte_rs2_signed(),
+                PCU::BGE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()).set_rs1_lt_rs2_signed(),
+
+                PCU::JAL.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
+                PCU::JALR.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
 
                 PCU::NONE.u_pc(rng().next_u32()).u_imm(rng().next_u32()).u_rs1(rng().next_u32()).u_rs2(rng().next_u32()),
+
              ].iter_mut().for_each(|pcu| {
                     let input_bitstring = pcu.bdd_encoded_input();
 
@@ -1542,7 +1696,7 @@ mod tests {
                     let want = pcu.expected_update();
 
                     if have_bdd != have_ggsw {
-                        println!("Udbdd output {have_ggsw} != bdd output {have_bdd}");
+                        println!("Udbdd output {:#b} != bdd output {:#b}", have_ggsw, have_bdd);
                     }
 
                     assert_eq!(
@@ -1580,26 +1734,25 @@ mod tests {
             .map(|b| updown_bdd_from_bdd(b, &sub_vars, &sub_input_order, None))
             .collect_vec();
 
-        println!(
-            "Add: {}",
-            add_bdds[bits - 1].to_dot_string(&add_vars, false)
-        );
-        println!("Add: Stats: {}", add_udbdds[bits - 1].stats());
-        println!(
-            "Sub: {}",
-            sub_bdds[bits - 1].to_dot_string(&add_vars, false)
-        );
-        println!("Sub: Stats: {}", sub_udbdds[bits - 1].stats());
+        // println!(
+        //     "Add: {}",
+        //     add_bdds[bits - 1].to_dot_string(&add_vars, false)
+        // );
+        // println!("Add: Stats: {}", add_udbdds[bits - 1].stats());
+        // println!(
+        //     "Sub: {}",
+        //     sub_bdds[bits - 1].to_dot_string(&add_vars, false)
+        // );
+        // println!("Sub: Stats: {}", sub_udbdds[bits - 1].stats());
 
-        codegen_multibit_output(&add_udbdds, "target/add_codegen.rs");
-        codegen_multibit_output(&sub_udbdds, "target/sub_codegen.rs");
+        // codegen_multibit_output(&add_udbdds, "target/add_codegen.rs");
+        // codegen_multibit_output(&sub_udbdds, "target/sub_codegen.rs");
 
         let bit_mask = bit_mask(bits);
 
-        for _ in 0..100 {
+        for _ in 0..1000 {
             let a = rng().next_u32() & bit_mask;
             let b = rng().next_u32() & bit_mask;
-            let b = 1;
 
             let input_bitstring = u32_to_bits(a)
                 .into_iter()
@@ -1607,8 +1760,6 @@ mod tests {
                 .collect_vec();
             let input_ggsw =
                 input_bitstring.iter().map(|b| GGSW::from(*b)).collect_vec();
-
-            execute(&add_udbdds[1], &input_ggsw);
 
             let add_out_ggsw = add_udbdds
                 .iter()
@@ -1653,23 +1804,23 @@ mod tests {
             None,
         );
 
-        println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
-        println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
-
-        codegen_multibit_output(
-            &[unsigned_udbdd.clone()],
-            "target/sltu_codegen.rs",
-        );
-        codegen_multibit_output(
-            &[signed_udbdd.clone()],
-            "target/slt_codegen.rs",
-        );
-
+        // println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
+        // println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
+        //
+        // codegen_multibit_output(
+        //     &[unsigned_udbdd.clone()],
+        //     "target/sltu_codegen.rs",
+        // );
+        // codegen_multibit_output(
+        //     &[signed_udbdd.clone()],
+        //     "target/slt_codegen.rs",
+        // );
+        //
         let input_order = unsigned_comparitor_input_order(bits);
         let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
 
         let bit_mask = bit_mask(bits);
-        for _ in 0..100 {
+        for _ in 0..1000 {
             let a = rng().next_u32() & bit_mask;
             let b = rng().next_u32() & bit_mask;
 
@@ -1743,13 +1894,13 @@ mod tests {
             })
             .collect_vec();
 
-        println!("And UpDownBDD stats: {}", and_udbdds[bits - 1].stats());
-        println!("Or UpDownBDD stats: {}", or_udbdds[bits - 1].stats());
-        println!("Xor UpDownBDD stats: {}", xor_udbdds[bits - 1].stats());
-
-        codegen_multibit_output(&and_udbdds, "target/and_codegen.rs");
-        codegen_multibit_output(&or_udbdds, "target/or_codegen.rs");
-        codegen_multibit_output(&xor_udbdds, "target/xor_codegen.rs");
+        // println!("And UpDownBDD stats: {}", and_udbdds[bits - 1].stats());
+        // println!("Or UpDownBDD stats: {}", or_udbdds[bits - 1].stats());
+        // println!("Xor UpDownBDD stats: {}", xor_udbdds[bits - 1].stats());
+        //
+        // codegen_multibit_output(&and_udbdds, "target/and_codegen.rs");
+        // codegen_multibit_output(&or_udbdds, "target/or_codegen.rs");
+        // codegen_multibit_output(&xor_udbdds, "target/xor_codegen.rs");
         // let input_order = unsigned_comparitor_input_order(bits);
         // let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
         //
@@ -1792,15 +1943,15 @@ mod tests {
                 ShiftOp::SRA | ShiftOp::SRL => 0,
             };
 
-            println!(
-                "{}",
-                bdds[index_most_expensive].to_dot_string(&vars, false)
-            );
+            // println!(
+            //     "{}",
+            //     bdds[index_most_expensive].to_dot_string(&vars, false)
+            // );
             // bdds.iter().for_each(|bdd| {
             //     println!("{}", bdd.to_dot_string(&vars, false));
             // });
 
-            let udbdds: Vec<UpDownBDD> = bdds
+            let udbdds = bdds
                 .iter()
                 .map(|bdd| {
                     updown_bdd_from_bdd(
@@ -1810,16 +1961,16 @@ mod tests {
                         None,
                     )
                 })
-                .collect();
-            println!("{}", udbdds[index_most_expensive].stats());
+                .collect_vec();
+            // println!("{}", udbdds[index_most_expensive].stats());
             // udbdds.iter().for_each(|udbb| {
             //     println!("{}", udbb.stats());
             // });
 
-            codegen_multibit_output(
-                &udbdds,
-                &format!("target/{}_codegen.rs", op_type),
-            );
+            // codegen_multibit_output(
+            //     &udbdds,
+            //     &format!("target/{}_codegen.rs", op_type),
+            // );
 
             for value in rng().random_iter::<u32>().take(1000) {
                 for shift in 0..1 << shift_bits {
