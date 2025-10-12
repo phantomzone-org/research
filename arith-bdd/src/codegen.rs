@@ -7,7 +7,7 @@ use crate::graph::{Node, UpdownBDD};
 
 pub(crate) struct CodegenUpDownBDD {
     nodes: Vec<Node>,
-    lvl_bounds: Vec<usize>,
+    _lvl_bounds: Vec<usize>,
     max_inter_state: usize,
 }
 
@@ -19,7 +19,7 @@ impl CodegenUpDownBDD {
     ) -> Self {
         CodegenUpDownBDD {
             nodes,
-            lvl_bounds,
+            _lvl_bounds: lvl_bounds,
             max_inter_state,
         }
     }
@@ -33,10 +33,9 @@ pub(crate) fn codegen_multibit_output(udbdds: &[UpdownBDD]) -> TokenStream {
         .enumerate()
         .map(|(bit_index, ubdd)| {
             let n = ubdd.nodes.len();
-            let k = ubdd.lvl_bounds.len();
+            // let k = ubdd.lvl_bounds.len();
             (
-                parse_str(&format!("B{bit_index}(BitCircuit<{n}, {k}>)"))
-                    .unwrap(),
+                parse_str(&format!("B{bit_index}(BitCircuit<{n}>)")).unwrap(),
                 parse_str(&format!("B{bit_index}")).unwrap(),
             )
         })
@@ -49,7 +48,7 @@ pub(crate) fn codegen_multibit_output(udbdds: &[UpdownBDD]) -> TokenStream {
         .enumerate()
         .map(|(bit_index, ubdd)| {
             let mut node_buffer = String::new();
-            let mut lvl_bounds_buffer = String::new();
+            // let mut lvl_bounds_buffer = String::new();
             ubdd.nodes.iter().for_each(|node| {
                 match node {
                     Node::OpNode(node) => node_buffer.push_str(&format!(
@@ -66,13 +65,13 @@ pub(crate) fn codegen_multibit_output(udbdds: &[UpdownBDD]) -> TokenStream {
                     }
                 };
             });
-            ubdd.lvl_bounds.iter().for_each(|v| {
-                lvl_bounds_buffer.push_str(&format!("{v},"));
-            });
+            // ubdd.lvl_bounds.iter().for_each(|v| {
+            //     lvl_bounds_buffer.push_str(&format!("{v},"));
+            // });
 
             parse_str(&format!(
-                "AnyBitCircuit::B{}(BitCircuit::new([{}], [{}], {}))",
-                bit_index, node_buffer, lvl_bounds_buffer, ubdd.max_inter_state
+                "AnyBitCircuit::B{}(BitCircuit::new([{}], {}))",
+                bit_index, node_buffer, ubdd.max_inter_state
             ))
             .unwrap()
         })
@@ -91,7 +90,6 @@ pub(crate) fn codegen_multibit_output(udbdds: &[UpdownBDD]) -> TokenStream {
                 #(
                     AnyBitCircuit::#v1(bit_circuit) => (
                         bit_circuit.nodes.as_ref(),
-                        bit_circuit.levels.as_ref(),
                         bit_circuit.max_inter_state
                     ),
                 )*

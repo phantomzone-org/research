@@ -146,8 +146,12 @@ impl UpdownBDD {
         &self.level_nodes
     }
 
-    pub(crate) fn max_width(&self) -> usize {
-        self.level_nodes()[0].len()
+    /// Width of the state vector
+    pub(crate) fn width(&self) -> usize {
+        // all levels have the same width
+        //
+        // minimum width is 2 to at-least account for terminal nodes
+        std::cmp::max(2, self.level_nodes()[0].len())
     }
 
     #[allow(dead_code)]
@@ -181,7 +185,7 @@ impl UpdownBDD {
             ));
         }
 
-        output.push_str(&format!("Maximum width: {}\n", self.max_width()));
+        output.push_str(&format!("Width: {}\n", self.width()));
 
         output
     }
@@ -197,7 +201,7 @@ impl UpdownBDD {
             nodes.extend_from_slice(level.as_slice());
         }
 
-        let max_inter_state = self.max_width();
+        let max_inter_state = self.width();
 
         CodegenUpDownBDD::new(nodes, lvl_bounds, max_inter_state)
     }

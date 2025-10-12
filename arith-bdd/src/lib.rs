@@ -181,7 +181,7 @@ mod tests {
     }
 
     pub(crate) fn execute(bdd: &UpdownBDD, inputs: &[GGSW]) -> GLWECt {
-        let mut out = vec![GLWECt::default(); bdd.max_width()];
+        let mut out = vec![GLWECt::default(); bdd.width()];
 
         out[0] = GLWECt::new(0);
         out[1] = GLWECt::new(1);
