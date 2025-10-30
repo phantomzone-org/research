@@ -1,7 +1,8 @@
 use arith_bdd::{
-    codegen_add, codegen_and, codegen_or, codegen_pc_update,
-    codegen_signed_comparitor, codegen_sll, codegen_sra, codegen_srl,
-    codegen_sub, codegen_unsigned_comparitor, codegen_xor,
+    codegen_add, codegen_aiupc, codegen_and, codegen_jalr, codegen_lui,
+    codegen_or, codegen_pc_update, codegen_signed_comparitor, codegen_sll,
+    codegen_sra, codegen_srl, codegen_sub, codegen_unsigned_comparitor,
+    codegen_xor,
 };
 use proc_macro2::TokenStream;
 use std::fs;
@@ -67,4 +68,13 @@ fn main() {
 
     // Generate PC update
     generate_and_write(codegen_pc_update(), "codegen_pc_update.rs", target_dir);
+
+    // Generate AIUPC
+    generate_and_write(codegen_aiupc(), "codegen_aiupc.rs", target_dir);
+
+    // Generate LUI
+    generate_and_write(codegen_lui(), "codegen_lui.rs", target_dir);
+
+    // Generate AIUPC
+    generate_and_write(codegen_jalr(), "codegen_jalr.rs", target_dir);
 }

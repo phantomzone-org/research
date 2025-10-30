@@ -2,6 +2,7 @@ pub mod arithmetic;
 pub mod bitwise;
 pub mod codegen;
 pub mod comparitor;
+pub mod extras;
 pub mod graph;
 pub mod pc_update;
 pub mod shift;
@@ -9,6 +10,7 @@ pub mod shift;
 pub use arithmetic::*;
 pub use bitwise::*;
 pub use comparitor::*;
+pub use extras::*;
 pub use pc_update::*;
 pub use shift::*;
 
@@ -223,125 +225,4 @@ mod tests {
             (1u32 << bits) - 1
         }
     }
-
-    //TODO: (jay) tests for combined circuits that are not needed at the moment.
-    //
-    // #[test]
-    // fn test_comparitors_combined() {
-    //     let bits = 32;
-    //     let (bdd, vars) = combined_comparitor_circuit(bits);
-    //     println!("{}", bdd.to_dot_string(&vars, false));
-    //
-    //     let input_order: Vec<String> = vec!["s".to_string()]
-    //         .into_iter()
-    //         .chain(
-    //             (0..bits)
-    //                 .map(|i| format!("a{}", i))
-    //                 .chain((0..bits).map(|i| format!("b{}", i))),
-    //         )
-    //         .collect();
-    //
-    //     let udbdd = updown_bdd_from_bdd(&bdd, &vars, &input_order);
-    //     // println!("Stats = {}", udbdd.stats());
-    // }
-    //
-    // #[test]
-    // fn test_shifts_combined() {
-    //     let bits = 32;
-    //     let shift_bits = 5;
-    //     let (bdds, vars) = shift_circuit_combined(bits, shift_bits);
-    //     // let input_order = shift_circuit_combined_input_order(bits, shift_bits);
-    //     // let udbdds = bdds.iter().map(|b| updown_bdd_from_bdd(b, &vars, &input_order)).collect_vec();
-    //     println!("{}", bdds[bits - 1].to_dot_string(&vars, false));
-    //
-    //     for (op_type, (s0, s1)) in [
-    //         (ShiftOp::SLL, (0, 0)),
-    //         (ShiftOp::SRL, (0, 1)),
-    //         (ShiftOp::SRA, (1, 1)),
-    //     ] {
-    //         for value in rng().random_iter::<u32>().take(1000) {
-    //             for shift in 0..1 << shift_bits {
-    //                 let inputs_bool: Vec<bool> = (0..shift_bits)
-    //                     .map(|i| (shift >> i) & 1 == 1)
-    //                     .chain(vec![s0 == 1, s1 == 1].into_iter())
-    //                     .chain((0..bits).map(|i| (value >> i) & 1 == 1))
-    //                     .collect();
-    //                 // println!("Input={:?}", &inputs_bool);
-    //
-    //                 let out_bdd: Vec<bool> = bdds
-    //                     .iter()
-    //                     .map(|bdd| {
-    //                         bdd.eval_in(&BddValuation::new(inputs_bool.clone()))
-    //                     })
-    //                     .collect();
-    //                 // println!("Out {:?}", &out_bdd.len());
-    //                 let have_out = out_bdd
-    //                     .iter()
-    //                     .enumerate()
-    //                     .fold(0u32, |res, (index, b)| {
-    //                         res + ((*b as u32) << index)
-    //                     });
-    //
-    //                 let want_out = match op_type {
-    //                     ShiftOp::SLL => value << shift,
-    //                     ShiftOp::SRL => value >> shift,
-    //                     ShiftOp::SRA => ((value as i32) >> (shift)) as u32,
-    //                 };
-    //
-    //                 assert_eq!(
-    //                     have_out, want_out,
-    //                     "Failed at {:#32b} {:?} {shift}. have_out={:#32b}, want_out={:#32b}",
-    //                     value, op_type, have_out, want_out
-    //                 );
-    //             }
-    //         }
-    //     }
-    // }
-    // #[test]
-    // fn test_add_sub() {
-    //     let bits = 32;
-    //     let (bdds, vars) = add_sub(bits);
-    //     let bdd_input_order = vars.variable_names();
-    //     let input_order = add_sub_input_order(bits);
-    //     let udbdds = bdds
-    //         .iter()
-    //         .map(|b| updown_bdd_from_bdd(b, &vars, &input_order))
-    //         .collect_vec();
-    //
-    //     println!("{}", bdds[bits - 1].to_dot_string(&vars, false));
-    //     println!("Stats: {}", udbdds[bits - 1].stats());
-    //
-    //     let bit_mask = bit_mask(bits);
-    //
-    //     for _ in 0..100 {
-    //         let a = rng().next_u32() & bit_mask;
-    //         let b = rng().next_u32() & bit_mask;
-    //
-    //         [0u8, 1].iter().for_each(|s| {
-    //             let input_bitstring = vec![*s]
-    //                 .into_iter()
-    //                 .chain(u32_to_bits(a).into_iter())
-    //                 .chain(u32_to_bits(b))
-    //                 .collect_vec();
-    //             let input_ggsw = input_bitstring
-    //                 .iter()
-    //                 .map(|b| GGSW::from(*b))
-    //                 .collect_vec();
-    //
-    //             let out_ggsw = udbdds
-    //                 .iter()
-    //                 .map(|udb| execute(udb, &input_ggsw).value as u8)
-    //                 .collect_vec();
-    //
-    //             let have_ggsw = bits_to_u32(&out_ggsw);
-    //             let want = if *s == 0 {
-    //                 a.wrapping_add(b)
-    //             } else {
-    //                 a.wrapping_sub(b)
-    //             };
-    //
-    //             assert_eq!(want, have_ggsw);
-    //         });
-    //     }
-    // }
 }

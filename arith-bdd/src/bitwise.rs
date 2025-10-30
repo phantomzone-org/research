@@ -116,9 +116,9 @@ mod tests {
             })
             .collect_vec();
 
-        println!("And UpDownBDD stats:\n{}", and_udbdds[bits - 1].stats());
-        println!("Or UpDownBDD stats: \n{}", or_udbdds[bits - 1].stats());
-        println!("Xor UpDownBDD stats:\n{}", xor_udbdds[bits - 1].stats());
+        // println!("And UpDownBDD stats:\n{}", and_udbdds[bits - 1].stats());
+        // println!("Or UpDownBDD stats: \n{}", or_udbdds[bits - 1].stats());
+        // println!("Xor UpDownBDD stats:\n{}", xor_udbdds[bits - 1].stats());
 
         let iterations = 100;
         let mut max = u32::MAX;

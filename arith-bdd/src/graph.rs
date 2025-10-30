@@ -1,5 +1,5 @@
 use biodivine_lib_bdd::*;
-use itertools::Itertools;
+use itertools::{Itertools, izip};
 use petgraph::Direction::{Incoming, Outgoing};
 use petgraph::Graph;
 use petgraph::algo::toposort;
@@ -151,7 +151,11 @@ impl UpdownBDD {
         // all levels have the same width
         //
         // minimum width is 2 to at-least account for terminal nodes
-        std::cmp::max(2, self.level_nodes()[0].len())
+        if self.level_nodes().is_empty() {
+            return 2;
+        } else {
+            std::cmp::max(2, self.level_nodes()[0].len())
+        }
     }
 
     #[allow(dead_code)]
@@ -369,7 +373,10 @@ pub(crate) fn updown_bdd_from_bdd(
     {
         let levels = levels_for_graph(&graph);
         levelise_graph(&mut graph, levels);
-        // println!("levelised udbdd {}", Dot::with_config(&graph, &[]));
+        // println!(
+        //     "levelised udbdd {}",
+        //     petgraph::dot::Dot::with_config(&graph, &[])
+        // );
     }
 
     // ==== process the levelised graph as a state vector machine ====
@@ -399,122 +406,147 @@ pub(crate) fn updown_bdd_from_bdd(
         levels_to_nodes_map.get(&0).unwrap(),
         &HashSet::from_iter([NodeIndex::new(0), NodeIndex::new(1)].into_iter())
     );
-    let mut nodes_to_outpos = HashMap::new();
-    nodes_to_outpos.insert(NodeIndex::new(0), 0usize);
-    nodes_to_outpos.insert(NodeIndex::new(1), 1usize);
-
     let mut level_nodes = vec![];
-    // skip the first and the last level
-    for l in 1..max_level {
-        let nodes_at_lvl = levels_to_nodes_map.get(&l).unwrap();
-        let mut pos_set: HashSet<usize> = HashSet::from_iter(0usize..max_width);
 
-        // Nodes are placed sorted by output position
-        let mut curr_level = vec![Node::None; max_width];
+    if max_level > 0 {
+        let mut nodes_to_outpos = HashMap::new();
+        nodes_to_outpos.insert(NodeIndex::new(0), 0usize);
+        nodes_to_outpos.insert(NodeIndex::new(1), 1usize);
 
-        // handle copy nodes
-        nodes_at_lvl.iter().filter_map(|n| {
-            let incoming_edges =
-                graph.edges_directed(*n, Incoming).collect_vec();
-            assert!(incoming_edges.len() <= 2);
-            if incoming_edges.len() == 1 {
-                assert!(
-                    incoming_edges[0].weight() == &2,
-                    "Node has one incoming edge but with weight not equal to 2"
-                );
-                return Some((incoming_edges[0].source(), *n));
-            }
-            None
-        }).for_each(|(parent_node, copy_node)| {
-                let parent_pos = *nodes_to_outpos.get(&parent_node).unwrap();
-                // println!("Copy node:{:?}, Parent node:{:?}, Parent Pos:{}, Parent lvl:{}", copy_node, parent_node, parent_pos, levels.get(&parent_node).unwrap());
-                assert!(pos_set.remove(&parent_pos)==true, "Copy node pos is inuse but some other copy node");
+        // skip the first and the last level
+        for l in 1..max_level {
+            let nodes_at_lvl = levels_to_nodes_map.get(&l).unwrap();
+            let mut pos_set: HashSet<usize> =
+                HashSet::from_iter(0usize..max_width);
 
-                let node_weight = graph.node_weight(copy_node).unwrap().clone();
-                curr_level[parent_pos]=Node::Copy(CopyNode::new(node_weight, parent_node, copy_node, parent_pos ));
+            // Nodes are placed sorted by output position
+            let mut curr_level = vec![Node::None; max_width];
 
-                nodes_to_outpos.insert(copy_node, parent_pos);
-            });
+            // handle copy nodes
+            nodes_at_lvl.iter().filter_map(|n| {
+                   let incoming_edges =
+                       graph.edges_directed(*n, Incoming).collect_vec();
+                   assert!(incoming_edges.len() <= 2);
+                   if incoming_edges.len() == 1 {
+                       assert!(
+                           incoming_edges[0].weight() == &2,
+                           "Node has one incoming edge but with weight not equal to 2"
+                       );
+                       return Some((incoming_edges[0].source(), *n));
+                   }
+                   None
+               }).for_each(|(parent_node, copy_node)| {
+                       let parent_pos = *nodes_to_outpos.get(&parent_node).unwrap();
+                       // println!("Copy node:{:?}, Parent node:{:?}, Parent Pos:{}, Parent lvl:{}", copy_node, parent_node, parent_pos, levels.get(&parent_node).unwrap());
+                       assert!(pos_set.remove(&parent_pos)==true, "Copy node pos is inuse but some other copy node");
 
-        // handle rest of the nodes
-        nodes_at_lvl
-            .iter()
-            .filter_map(|n| {
-                let mut incoming_edges =
-                    graph.edges_directed(*n, Incoming).collect_vec();
-                if incoming_edges.len() == 2 {
-                    // sort edges: low_index, high_index
-                    incoming_edges.sort_by(|a, b| a.weight().cmp(b.weight()));
-                    assert!(
-                        incoming_edges[0].weight() == &0
-                            && incoming_edges[1].weight() == &1
+                       let node_weight = graph.node_weight(copy_node).unwrap().clone();
+                       curr_level[parent_pos]=Node::Copy(CopyNode::new(node_weight, parent_node, copy_node, parent_pos ));
+
+                       nodes_to_outpos.insert(copy_node, parent_pos);
+                   });
+
+            // handle rest of the nodes
+            let mut pos_set = pos_set.into_iter().collect_vec();
+            pos_set.sort();
+            let nodes_at_lvl_two_parents = nodes_at_lvl
+                .iter()
+                .filter_map(|n| {
+                    let mut incoming_edges =
+                        graph.edges_directed(*n, Incoming).collect_vec();
+                    if incoming_edges.len() == 2 {
+                        // sort edges: low_index, high_index
+                        incoming_edges
+                            .sort_by(|a, b| a.weight().cmp(b.weight()));
+                        assert!(
+                            incoming_edges[0].weight() == &0
+                                && incoming_edges[1].weight() == &1
+                        );
+                        // (low_node, high_node, curr_node)
+                        return Some((
+                            incoming_edges[0].source(),
+                            incoming_edges[1].source(),
+                            *n,
+                        ));
+                    }
+                    None
+                })
+                .collect_vec();
+            assert!(
+                pos_set.len() >= nodes_at_lvl_two_parents.len(),
+                "Not enough positions left to assign to nodes with two parents"
+            );
+            izip!(nodes_at_lvl_two_parents.into_iter(), pos_set.into_iter())
+                .for_each(|((low_node, high_node, curr_node), curr_pos)| {
+                    let high_index = *nodes_to_outpos.get(&high_node).unwrap();
+                    let low_index = *nodes_to_outpos.get(&low_node).unwrap();
+                    let node_weight =
+                        graph.node_weight(curr_node).unwrap().clone();
+                    let input_index = translate_node_tag_to_input_index(
+                        &node_weight,
+                        input_order,
+                        alias_map,
                     );
-                    // (low_node, high_node, curr_node)
-                    return Some((
-                        incoming_edges[0].source(),
-                        incoming_edges[1].source(),
-                        *n,
+                    curr_level[curr_pos] = Node::OpNode(OpNode::new(
+                        node_weight,
+                        curr_node,
+                        high_node,
+                        low_node,
+                        curr_pos,
+                        high_index,
+                        low_index,
+                        input_index,
                     ));
-                }
-                None
-            })
-            .for_each(|(low_node, high_node, curr_node)| {
-                let curr_pos = pos_set.iter().next().cloned().expect("Positions ran out before each node at level has a position");
-                assert!(pos_set.remove(&curr_pos));
 
-                let high_index =*nodes_to_outpos.get(&high_node).unwrap();
-                let low_index =* nodes_to_outpos.get(&low_node).unwrap();
-                let node_weight = graph.node_weight(curr_node).unwrap().clone();
-                let input_index = translate_node_tag_to_input_index(&node_weight, input_order, alias_map);
-                curr_level[curr_pos] = Node::OpNode(OpNode::new(node_weight, curr_node,high_node ,low_node, curr_pos, high_index, low_index, input_index));
+                    nodes_to_outpos.insert(curr_node, curr_pos);
+                });
 
-                nodes_to_outpos.insert(curr_node, curr_pos);
-            });
+            // println!("Lvl {}: {:?}", l, curr_level);
+            level_nodes.push(curr_level);
+        }
 
-        // println!("Lvl {}: {:?}", l, curr_level);
-        level_nodes.push(curr_level);
+        // process last level
+        //
+        // force output node output pos as 0
+        {
+            let output_node = levels_to_nodes_map.get(&max_level).unwrap();
+            assert_eq!(output_node.len(), 1);
+            let output_node = output_node.iter().last().unwrap().clone();
+
+            let mut incoming_edges =
+                graph.edges_directed(output_node, Incoming).collect_vec();
+            incoming_edges.sort_by(|a, b| a.weight().cmp(b.weight()));
+            assert!(
+                incoming_edges[0].weight() == &0
+                    && incoming_edges[1].weight() == &1
+            );
+            let high_node = incoming_edges[1].source();
+            let low_node = incoming_edges[0].source();
+
+            let high_index = *nodes_to_outpos.get(&high_node).unwrap();
+            let low_index = *nodes_to_outpos.get(&low_node).unwrap();
+            let node_weight = graph.node_weight(output_node).unwrap().clone();
+            let input_index = translate_node_tag_to_input_index(
+                &node_weight,
+                input_order,
+                alias_map,
+            );
+            let mut tmp_vec = vec![Node::None; max_width];
+            tmp_vec[0] = Node::OpNode(OpNode::new(
+                node_weight,
+                output_node,
+                high_node,
+                low_node,
+                0,
+                high_index,
+                low_index,
+                input_index,
+            ));
+            level_nodes.push(tmp_vec);
+
+            nodes_to_outpos.insert(output_node, 0);
+        }
     }
 
-    // process last level
-    //
-    // force output node output pos as 0
-    {
-        let output_node = levels_to_nodes_map.get(&max_level).unwrap();
-        assert_eq!(output_node.len(), 1);
-        let output_node = output_node.iter().last().unwrap().clone();
-
-        let mut incoming_edges =
-            graph.edges_directed(output_node, Incoming).collect_vec();
-        incoming_edges.sort_by(|a, b| a.weight().cmp(b.weight()));
-        assert!(
-            incoming_edges[0].weight() == &0
-                && incoming_edges[1].weight() == &1
-        );
-        let high_node = incoming_edges[1].source();
-        let low_node = incoming_edges[0].source();
-
-        let high_index = *nodes_to_outpos.get(&high_node).unwrap();
-        let low_index = *nodes_to_outpos.get(&low_node).unwrap();
-        let node_weight = graph.node_weight(output_node).unwrap().clone();
-        let input_index = translate_node_tag_to_input_index(
-            &node_weight,
-            input_order,
-            alias_map,
-        );
-        let mut tmp_vec = vec![Node::None; max_width];
-        tmp_vec[0] = Node::OpNode(OpNode::new(
-            node_weight,
-            output_node,
-            high_node,
-            low_node,
-            0,
-            high_index,
-            low_index,
-            input_index,
-        ));
-        level_nodes.push(tmp_vec);
-
-        nodes_to_outpos.insert(output_node, 0);
-    }
     UpdownBDD::new(level_nodes)
 }

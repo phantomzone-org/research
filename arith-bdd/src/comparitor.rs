@@ -171,8 +171,8 @@ mod tests {
             None,
         );
 
-        println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
-        println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
+        // println!("Unsigned UpDownBDD stats: {}", unsigned_udbdd.stats());
+        // println!("Signed UpDownBDD stats: {}", signed_udbdd.stats());
 
         let input_order = unsigned_comparitor_input_order(bits);
         let bdd_var_order = unsigned_comparitor_bdd_variable_order(bits);
