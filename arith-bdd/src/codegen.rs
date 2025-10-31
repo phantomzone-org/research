@@ -25,7 +25,11 @@ impl CodegenUpDownBDD {
     }
 }
 
-pub(crate) fn codegen_multibit_output(udbdds: &[UpdownBDD]) -> TokenStream {
+pub(crate) fn codegen_multibit_output(
+    input_len: usize,
+    output_len: usize,
+    udbdds: &[UpdownBDD],
+) -> TokenStream {
     let udbdds = udbdds.iter().map(|b| b.to_codegen()).collect_vec();
 
     let (v0, v1): (Vec<TokenStream>, Vec<TokenStream>) = udbdds
@@ -82,6 +86,11 @@ pub(crate) fn codegen_multibit_output(udbdds: &[UpdownBDD]) -> TokenStream {
     let p2 = quote! {
         pub(crate) enum AnyBitCircuit {
             #(#v0,)*
+        }
+
+        impl BitCircuitFamily for AnyBitCircuit {
+            const INPUT_BITS: usize = #input_len;
+            const OUTPUT_BITS: usize = #output_len;
         }
 
         impl BitCircuitInfo for AnyBitCircuit {

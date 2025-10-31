@@ -105,20 +105,13 @@ fn codegen_shift(word_size: usize, shift_op: ShiftOp) -> TokenStream {
     let shift_bits = (usize::BITS - word_size.leading_zeros() - 1) as usize;
 
     let (bdds, vars) = shift_circuit(word_size, shift_bits, shift_op);
-
+    let input_order = input_order(word_size, shift_bits);
     let udbdds = bdds
         .iter()
-        .map(|bdd| {
-            updown_bdd_from_bdd(
-                bdd,
-                &vars,
-                &input_order(word_size, shift_bits),
-                None,
-            )
-        })
+        .map(|bdd| updown_bdd_from_bdd(bdd, &vars, &input_order, None))
         .collect_vec();
 
-    codegen_multibit_output(&udbdds)
+    codegen_multibit_output(input_order.len(), bdds.len(), &udbdds)
 }
 
 pub fn codegen_sll(word_size: usize) -> TokenStream {

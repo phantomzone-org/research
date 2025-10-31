@@ -175,7 +175,7 @@ pub fn codegen_pc_update() -> TokenStream {
         })
         .collect_vec();
 
-    codegen_multibit_output(&udbdds)
+    codegen_multibit_output(input_order.len(), bdds.len(), &udbdds)
 }
 #[cfg(test)]
 mod test {

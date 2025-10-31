@@ -123,7 +123,7 @@ fn codegen_generic(
         .map(|bdd| updown_bdd_from_bdd(bdd, &vars, &input_order, None))
         .collect_vec();
 
-    codegen_multibit_output(&udbdds)
+    codegen_multibit_output(input_order.len(), bdds.len(), &udbdds)
 }
 
 pub fn codegen_aiupc() -> TokenStream {

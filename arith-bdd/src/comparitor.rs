@@ -119,7 +119,7 @@ fn codegen_comp_op(
     let input_order = unsigned_comparitor_input_order(word_size);
     let udbdds = vec![updown_bdd_from_bdd(&bdd, &vars, &input_order, None)];
 
-    codegen_multibit_output(&udbdds)
+    codegen_multibit_output(input_order.len(), 1, &udbdds)
 }
 
 pub fn codegen_unsigned_comparitor(word_size: usize) -> TokenStream {
