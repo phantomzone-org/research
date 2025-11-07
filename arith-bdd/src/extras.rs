@@ -9,6 +9,84 @@ use proc_macro2::TokenStream;
 
 use crate::{codegen::codegen_multibit_output, graph::updown_bdd_from_bdd};
 
+fn ram_offset_input_order() -> Vec<String> {
+    let bits = 32;
+    (0..bits)
+        .map(|i| format!("rs{}", i))
+        .chain((0..bits).map(|i| format!("imm{}", i)))
+        .collect()
+}
+
+/// rs + imm - offset
+///
+/// offset is a constant
+fn ram_address_offset(ram_offset: u32) -> (Vec<Bdd>, BddVariableSet) {
+    let neg_ram_offset = ram_offset
+        .wrapping_neg()
+        .to_le_bytes()
+        .iter()
+        .flat_map(|v| (0..8).map(move |i| (v >> i & 1) == 1))
+        .collect_vec();
+
+    // println!(
+    //     "RAM OFFSET: {:?} {:?}",
+    //     ram_offset.wrapping_neg().to_le_bytes(),
+    //     &neg_ram_offset
+    // );
+
+    let vars_arr: Vec<String> = (0..32)
+        .flat_map(|i| [format!("rs{}", i), format!("imm{}", i)])
+        .collect();
+    let vars_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
+    let vars = BddVariableSet::new(&vars_ref);
+    let mut a = vec![];
+    let mut b = vec![];
+    (0..32).for_each(|i| {
+        a.push(vars.mk_var_by_name(&format!("rs{}", i)));
+        b.push(vars.mk_var_by_name(&format!("imm{}", i)));
+    });
+
+    let mut out = vec![];
+    // rs+imm
+    {
+        // Half adder
+        // c_in = 0
+        out.push(a[0].xor(&b[0]));
+        let mut c = a[0].and(&b[0]);
+
+        for i in 1..32 {
+            // full adder
+            let s = (a[i].xor(&b[i])).xor(&c);
+            out.push(s);
+            c = (a[i].and(&b[i])).or(&(a[i].xor(&b[i])).and(&c));
+        }
+    }
+    // Another adder
+    // (rs+imm)-ram_offset
+    {
+        let mut c = vars.mk_false();
+        if neg_ram_offset[0] {
+            out[0] = out[0].not();
+            c = out[0].clone();
+        }
+
+        for i in 1..32 {
+            // full adder
+            if neg_ram_offset[i] {
+                let tmp = out[i].clone();
+                out[i] = (tmp.not()).xor(&c);
+                c = tmp.or(&(tmp.not()).and(&c));
+            } else {
+                let tmp = out[i].clone();
+                out[i] = tmp.xor(&c);
+                c = tmp.and(&c);
+            }
+        }
+    }
+
+    (out, vars)
+}
+
 fn aiupc_input_order() -> Vec<String> {
     (0..32)
         .map(|i| format!("pc{}", i))
@@ -112,10 +190,13 @@ fn lui() -> (Vec<Bdd>, BddVariableSet) {
     (out, vars)
 }
 
-fn codegen_generic(
-    op_fn: fn() -> (Vec<Bdd>, BddVariableSet),
+fn codegen_generic<F>(
+    op_fn: F,
     input_order_fn: fn() -> Vec<String>,
-) -> TokenStream {
+) -> TokenStream
+where
+    F: FnOnce() -> (Vec<Bdd>, BddVariableSet),
+{
     let (bdds, vars) = op_fn();
     let input_order = input_order_fn();
     let udbdds = bdds
@@ -138,6 +219,10 @@ pub fn codegen_lui() -> TokenStream {
     codegen_generic(lui, lui_input_order)
 }
 
+pub fn codegen_ram_address_offset(ram_offset: u32) -> TokenStream {
+    codegen_generic(|| ram_address_offset(ram_offset), ram_offset_input_order)
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -146,7 +231,7 @@ mod tests {
     use crate::{
         extras::{
             aiupc, aiupc_input_order, jalr, jalr_input_order, lui,
-            lui_input_order,
+            lui_input_order, ram_address_offset, ram_offset_input_order,
         },
         graph::updown_bdd_from_bdd,
         tests::{GGSW, bits_to_u32, execute, u32_to_bits},
@@ -240,6 +325,48 @@ mod tests {
                 have, want,
                 "have={:#32b}, want={:#32b}; imm={:#b}",
                 have, want, imm
+            );
+        }
+    }
+
+    #[test]
+    fn test_ram_address_offset() {
+        let ram_offset = 1 << 18;
+        let (bdds, vars) = ram_address_offset(ram_offset);
+        let input_order = ram_offset_input_order();
+        let udbdds = bdds
+            .iter()
+            .map(|b| updown_bdd_from_bdd(b, &vars, &input_order, None))
+            .collect_vec();
+
+        // println!(
+        //     "RAM_ADDRESS_OFFSET: Stats for bit 31:\n{}",
+        //     udbdds[31].stats()
+        // );
+
+        for _ in 0..1000 {
+            let rs = rng().next_u32();
+            let imm = rng().next_u32();
+
+            let input_bitstring = u32_to_bits(rs)
+                .into_iter()
+                .chain(u32_to_bits(imm).into_iter())
+                .collect_vec();
+            let input_ggsw =
+                input_bitstring.iter().map(|b| GGSW::from(*b)).collect_vec();
+
+            let out_ggsw = udbdds
+                .iter()
+                .map(|udb| execute(udb, &input_ggsw).value() as u8)
+                .collect_vec();
+
+            let have_ggsw = bits_to_u32(&out_ggsw);
+            let want = rs.wrapping_add(imm).wrapping_sub(ram_offset);
+
+            assert_eq!(
+                want, have_ggsw,
+                "want={:b}, have={:b}",
+                want, have_ggsw
             );
         }
     }

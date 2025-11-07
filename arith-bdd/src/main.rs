@@ -1,8 +1,8 @@
 use arith_bdd::{
     codegen_add, codegen_aiupc, codegen_and, codegen_jalr, codegen_lui,
-    codegen_or, codegen_pc_update, codegen_signed_comparitor, codegen_sll,
-    codegen_sra, codegen_srl, codegen_sub, codegen_unsigned_comparitor,
-    codegen_xor,
+    codegen_or, codegen_pc_update, codegen_ram_address_offset,
+    codegen_signed_comparitor, codegen_sll, codegen_sra, codegen_srl,
+    codegen_sub, codegen_unsigned_comparitor, codegen_xor,
 };
 use proc_macro2::TokenStream;
 use std::fs;
@@ -77,4 +77,11 @@ fn main() {
 
     // Generate AIUPC
     generate_and_write(codegen_jalr(), "codegen_jalr.rs", target_dir);
+
+    // Generate RAM offset circuit for offset 2^18
+    generate_and_write(
+        codegen_ram_address_offset(2u32.pow(18)),
+        "codegen_ram_offset.rs",
+        target_dir,
+    );
 }
