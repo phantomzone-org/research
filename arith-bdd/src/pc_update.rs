@@ -8,6 +8,7 @@ use crate::{codegen::codegen_multibit_output, graph::updown_bdd_from_bdd};
 
 fn input_order() -> (Vec<String>, HashMap<String, String>) {
     let bits = 32;
+    let mut alias_map = HashMap::new();
     let mut out = vec![
         "s0".to_string(),
         "s1".to_string(),
@@ -16,6 +17,7 @@ fn input_order() -> (Vec<String>, HashMap<String, String>) {
     ];
     (0..bits).for_each(|i| {
         out.push(format!("rs1_{}", i));
+        alias_map.insert(format!("rs1_c_{}", i), format!("rs1_{}", i));
     });
     (0..bits).for_each(|i| {
         out.push(format!("rs2_{}", i));
@@ -27,7 +29,6 @@ fn input_order() -> (Vec<String>, HashMap<String, String>) {
         out.push(format!("imm{}", i));
     });
 
-    let mut alias_map = HashMap::new();
     alias_map.insert("s2_c".to_string(), "s2".to_string());
     alias_map.insert("s2_2c".to_string(), "s2".to_string());
     alias_map.insert("s0_c".to_string(), "s0".to_string());
@@ -62,9 +63,15 @@ fn pc_update(// bits: usize,
                     .chain(
                         (0..20)
                             .flat_map(|i| {
-                                [format!("imm{}", i), format!("pc{}", i)]
+                                [
+                                    format!("pc{}", i),
+                                    format!("rs1_c_{}", i),
+                                    format!("imm{}", i),
+                                ]
                             })
-                            .chain((20..32).map(|i| format!("pc{}", i))),
+                            .chain((20..32).flat_map(|i| {
+                                [format!("rs1_c_{}", i), format!("pc{}", i)]
+                            })),
                     ),
                 ),
         )
@@ -83,9 +90,11 @@ fn pc_update(// bits: usize,
     let s2_2c = vars.mk_var_by_name("s2_2c");
 
     let mut rs1 = vec![];
+    let mut rs1_c = vec![];
     let mut rs2 = vec![];
     (0..bits).for_each(|i| {
         rs1.push(vars.mk_var_by_name(&format!("rs1_{}", i)));
+        rs1_c.push(vars.mk_var_by_name(&format!("rs1_c_{}", i)));
         rs2.push(vars.mk_var_by_name(&format!("rs2_{}", i)));
     });
 
@@ -122,39 +131,47 @@ fn pc_update(// bits: usize,
     let choose_ne_eq = Bdd::if_then_else(&s2_c, &not_casc.not(), &not_casc);
     let left_root = Bdd::if_then_else(&s1, &choose_lt_ge, &choose_ne_eq);
     // right_root = s1
+    // TODO: maybe duplicae s1 here
     let is_op = Bdd::if_then_else(&s0, &s1, &left_root);
+    let is_jalr = s0_c.and(&s1_c.and(&s2_2c));
 
     // 0th bit
     let mut out = vec![];
+    let lhs = Bdd::if_then_else(&is_jalr, &rs1_c[0], &pc[0]);
     let rhs = Bdd::if_then_else(&is_op, &imm[0], &vars.mk_false());
-    let mut c = pc[0].and(&rhs);
-    let is_jalr = s0_c.and(&s1_c.and(&s2_2c));
+    let mut c = lhs.and(&rhs);
     out.push(Bdd::if_then_else(
         &is_jalr,
         &vars.mk_false(),
-        &pc[0].xor(&rhs),
+        &lhs.xor(&rhs),
     ));
 
     // 1st bit
+    let lhs = Bdd::if_then_else(&is_jalr, &rs1_c[1], &pc[1]);
     let rhs = Bdd::if_then_else(&is_op, &imm[1], &vars.mk_false());
-    out.push((pc[1].xor(&rhs)).xor(&c));
-    c = (pc[1].and(&rhs)).or(&(pc[1].xor(&rhs)).and(&c));
+    out.push((lhs.xor(&rhs)).xor(&c));
+    c = (lhs.and(&rhs)).or(&(lhs.xor(&rhs)).and(&c));
 
     // 2nd bit
+    let lhs = Bdd::if_then_else(&is_jalr, &rs1_c[2], &pc[2]);
     let rhs = Bdd::if_then_else(&is_op, &imm[2], &vars.mk_true());
-    out.push((pc[2].xor(&rhs)).xor(&c));
-    c = (pc[2].and(&rhs)).or(&(pc[2].xor(&rhs)).and(&c));
+    out.push((lhs.xor(&rhs)).xor(&c));
+    c = (lhs.and(&rhs)).or(&(lhs.xor(&rhs)).and(&c));
 
     // [3:19] bit
     for i in 3..20 {
+        let lhs = Bdd::if_then_else(&is_jalr, &rs1_c[i], &pc[i]);
         let rhs = Bdd::if_then_else(&is_op, &imm[i], &vars.mk_false());
-        out.push((pc[i].xor(&rhs)).xor(&c));
-        c = (pc[i].and(&rhs)).or(&(pc[i].xor(&rhs)).and(&c));
+
+        out.push((lhs.xor(&rhs)).xor(&c));
+        c = (lhs.and(&rhs)).or(&(lhs.xor(&rhs)).and(&c));
     }
     let imm_sign = Bdd::if_then_else(&is_op, &imm[19], &vars.mk_false());
     for i in 20..32 {
-        out.push((pc[i].xor(&imm_sign)).xor(&c));
-        c = (pc[i].and(&imm_sign)).or(&(pc[i].xor(&imm_sign)).and(&c));
+        let lhs = Bdd::if_then_else(&is_jalr, &rs1_c[i], &pc[i]);
+
+        out.push((lhs.xor(&imm_sign)).xor(&c));
+        c = (lhs.and(&imm_sign)).or(&(lhs.xor(&imm_sign)).and(&c));
     }
 
     (out, vars)
@@ -392,7 +409,7 @@ mod test {
                     }
                 }
                 PCU_T::JAL => self.pc.wrapping_add(se_imm),
-                PCU_T::JALR => (self.pc.wrapping_add(se_imm).wrapping_shr(1))
+                PCU_T::JALR => (self.rs1.wrapping_add(se_imm).wrapping_shr(1))
                     .wrapping_shl(1),
             }
         }
@@ -402,6 +419,7 @@ mod test {
     fn test_pc_update() {
         let (bdd, vars) = pc_update();
         let bdd_input_order = vars.variable_names();
+        dbg!("AS");
         let (input_order, input_alias_map) = input_order();
         let udbdds = bdd
             .iter()
