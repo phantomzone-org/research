@@ -9,6 +9,23 @@ use proc_macro2::TokenStream;
 
 use crate::{codegen::codegen_multibit_output, graph::updown_bdd_from_bdd};
 
+fn identity_input_order(bits: usize) -> Vec<String> {
+    (0..bits).map(|i| format!("x_{}", i)).collect()
+}
+
+fn identity(bits: usize) -> (Vec<Bdd>, BddVariableSet) {
+    let vars_arr = (0..bits).map(|i| format!("x_{}", i)).collect_vec();
+    let vars_ref: Vec<&str> = vars_arr.iter().map(|a| a.as_str()).collect();
+    let vars = BddVariableSet::new(&vars_ref);
+
+    // identity
+    let mut out = vec![];
+    for i in 0..32 {
+        out.push(vars.mk_var_by_name(&format!("x_{}", i)));
+    }
+    (out, vars)
+}
+
 fn ram_offset_input_order() -> Vec<String> {
     let bits = 32;
     (0..bits)
@@ -190,12 +207,10 @@ fn lui() -> (Vec<Bdd>, BddVariableSet) {
     (out, vars)
 }
 
-fn codegen_generic<F>(
-    op_fn: F,
-    input_order_fn: fn() -> Vec<String>,
-) -> TokenStream
+fn codegen_generic<F, F1>(op_fn: F, input_order_fn: F1) -> TokenStream
 where
     F: FnOnce() -> (Vec<Bdd>, BddVariableSet),
+    F1: FnOnce() -> Vec<String>,
 {
     let (bdds, vars) = op_fn();
     let input_order = input_order_fn();
@@ -223,6 +238,10 @@ pub fn codegen_ram_address_offset(ram_offset: u32) -> TokenStream {
     codegen_generic(|| ram_address_offset(ram_offset), ram_offset_input_order)
 }
 
+pub fn codegen_identity(bits: usize) -> TokenStream {
+    codegen_generic(|| identity(bits), || identity_input_order(bits))
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -230,8 +249,9 @@ mod tests {
 
     use crate::{
         extras::{
-            aiupc, aiupc_input_order, jalr, jalr_input_order, lui,
-            lui_input_order, ram_address_offset, ram_offset_input_order,
+            aiupc, aiupc_input_order, identity, identity_input_order, jalr,
+            jalr_input_order, lui, lui_input_order, ram_address_offset,
+            ram_offset_input_order,
         },
         graph::updown_bdd_from_bdd,
         tests::{GGSW, bits_to_u32, execute, u32_to_bits},
@@ -362,6 +382,45 @@ mod tests {
 
             let have_ggsw = bits_to_u32(&out_ggsw);
             let want = rs.wrapping_add(imm).wrapping_sub(ram_offset);
+
+            assert_eq!(
+                want, have_ggsw,
+                "want={:b}, have={:b}",
+                want, have_ggsw
+            );
+        }
+    }
+
+    #[test]
+    fn test_identity() {
+        let bits = 32;
+        let (bdds, vars) = identity(bits);
+        let input_order = identity_input_order(bits);
+        let udbdds = bdds
+            .iter()
+            .map(|b| updown_bdd_from_bdd(b, &vars, &input_order, None))
+            .collect_vec();
+
+        // println!(
+        //     "IDENTITY: Stats for bit {}:\n{}",
+        //     bits - 1,
+        //     udbdds[bits - 1].stats()
+        // );
+
+        for _ in 0..1000 {
+            let x = rng().next_u32();
+
+            let input_bitstring = u32_to_bits(x);
+            let input_ggsw =
+                input_bitstring.iter().map(|b| GGSW::from(*b)).collect_vec();
+
+            let out_ggsw = udbdds
+                .iter()
+                .map(|udb| execute(udb, &input_ggsw).value() as u8)
+                .collect_vec();
+
+            let have_ggsw = bits_to_u32(&out_ggsw);
+            let want = x;
 
             assert_eq!(
                 want, have_ggsw,

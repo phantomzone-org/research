@@ -1,6 +1,6 @@
 use arith_bdd::{
-    codegen_add, codegen_aiupc, codegen_and, codegen_jalr, codegen_lui,
-    codegen_or, codegen_pc_update, codegen_ram_address_offset,
+    codegen_add, codegen_aiupc, codegen_and, codegen_identity, codegen_jalr,
+    codegen_lui, codegen_or, codegen_pc_update, codegen_ram_address_offset,
     codegen_signed_comparitor, codegen_sll, codegen_sra, codegen_srl,
     codegen_sub, codegen_unsigned_comparitor, codegen_xor,
 };
@@ -84,4 +84,7 @@ fn main() {
         "codegen_ram_offset.rs",
         target_dir,
     );
+
+    // Generate identity
+    generate_and_write(codegen_identity(32), "codegen_identity.rs", target_dir);
 }
